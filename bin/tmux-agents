@@ -1,0 +1,461 @@
+#!/bin/sh
+# tmux-agents: track coding agents (Claude Code, OpenCode, ...) per tmux pane.
+#
+# State lives in tmux pane user options, so there is no daemon:
+#   @agent              agent name (claude, opencode, ...)
+#   @agent_state        working | blocked | done | idle
+#   @agent_since        epoch seconds of the last state change
+#   @agent_note         short detail ("needs approval")
+#   @agent_shell_since  when the pane was first seen back at a shell (sweep)
+# Each window also gets @agent_win_state (most urgent state of its panes)
+# and @agent_win_agent (that pane's agent), used by the tab icons.
+#
+# Hot path (agent hooks) is POSIX sh + a few tmux calls: keep it fast.
+
+set -u
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DEFAULTS="$ROOT/defaults.conf"
+SHELLS=" zsh bash sh fish dash ksh tcsh nu login "
+STALE_SECONDS=3 # agent pane back at a shell this long -> agent exited
+
+# --- helpers -----------------------------------------------------------------
+
+# opt <name>: tmux option, else the value from defaults.conf.
+opt() {
+  v=$(tmux show -gqv "$1")
+  [ -n "$v" ] || v=$(awk -v k="$1" '$1 == k { sub(/^[^ ]+ ?/, ""); print; exit }' "$DEFAULTS")
+  printf '%s' "$v"
+}
+
+rank() { # urgency: higher wins for the window icon
+  case "$1" in blocked) echo 4 ;; done) echo 3 ;; working) echo 2 ;; idle) echo 1 ;; *) echo 0 ;; esac
+}
+
+# Recompute @agent_win_state for the window holding (live) pane $1.
+update_window() {
+  best=""
+  best_agent=""
+  best_rank=0
+  for sa in $(tmux list-panes -t "$1" -F '#{@agent_state}:#{@agent}' 2>/dev/null); do
+    s=${sa%%:*}
+    r=$(rank "$s")
+    if [ "$r" -gt "$best_rank" ]; then best=$s; best_agent=${sa#*:}; best_rank=$r; fi
+  done
+  if [ -n "$best" ]; then
+    tmux set -w -t "$1" @agent_win_state "$best" \; set -w -t "$1" @agent_win_agent "$best_agent"
+  else
+    tmux set -wu -t "$1" @agent_win_state \; set -wu -t "$1" @agent_win_agent 2>/dev/null
+  fi
+}
+
+# Recompute @agent_win_state for every window in one pass; works when the
+# pane that changed is already gone. Only changed windows are written.
+update_all_windows() {
+  {
+    tmux list-windows -a -F 'W #{window_id} #{@agent_win_state} #{@agent_win_agent}' 2>/dev/null
+    tmux list-panes -a -f '#{@agent_state}' -F 'P #{window_id} #{@agent_state} #{@agent}' 2>/dev/null
+  } | awk '
+    function rank(s) { return s == "blocked" ? 4 : s == "done" ? 3 : s == "working" ? 2 : s == "idle" ? 1 : 0 }
+    $1 == "W" { cur[$2] = $3; cura[$2] = $4; order[++n] = $2 }
+    $1 == "P" && rank($3) > rank(best[$2]) { best[$2] = $3; agent[$2] = $4 }
+    END {
+      for (i = 1; i <= n; i++) {
+        w = order[i]
+        if (best[w] == cur[w] && agent[w] == cura[w]) continue
+        if (best[w] == "") print "set -wu -t " w " @agent_win_state ; set -wu -t " w " @agent_win_agent"
+        else print "set -w -t " w " @agent_win_state " best[w] " ; set -w -t " w " @agent_win_agent \"" agent[w] "\""
+      }
+    }' | tmux source-file - 2>/dev/null
+}
+
+# The sidebar draws its own right-edge line, so windows holding it get tmux's
+# active-pane border hidden (same style as the inactive one): with two panes
+# tmux colors half the shared border, which looks like a scrollbar beside
+# ours. Reverted when the sidebar leaves the window. Only changes are written.
+sync_borders() {
+  cmds=$({
+    tmux list-windows -a -F 'W #{window_id} #{@agents_border_hidden}' 2>/dev/null
+    tmux list-panes -a -f '#{@agents_sidebar}' -F 'S #{window_id}' 2>/dev/null
+  } | awk -v style="$(tmux show -gwv pane-border-style)" '
+    $1 == "W" { hidden[$2] = $3; order[++n] = $2 }
+    $1 == "S" { sb[$2] = 1 }
+    END {
+      for (i = 1; i <= n; i++) {
+        w = order[i]
+        if (sb[w] && hidden[w] != "1")
+          print "set -w -t " w " pane-active-border-style \"" style "\" ; set -w -t " w " @agents_border_hidden 1"
+        else if (!sb[w] && hidden[w] == "1")
+          print "set -wu -t " w " pane-active-border-style ; set -wu -t " w " @agents_border_hidden"
+      }
+    }')
+  [ -n "$cmds" ] && printf '%s\n' "$cmds" | tmux source-file - 2>/dev/null
+  return 0
+}
+
+# One sidebar per session: two hooks racing through "open" can each split
+# one. Keep the oldest (lowest pane id), so racing callers agree.
+dedupe_sidebars() {
+  tmux list-panes -s -t "$1" -f '#{@agents_sidebar}' -F '#{pane_id}' 2>/dev/null |
+    sed 's/^%//' | sort -n | tail -n +2 | while read -r n; do
+      tmux kill-pane -t "%$n" 2>/dev/null
+    done
+}
+
+# Ask the sidebar(s) to redraw now instead of waiting for their next tick.
+poke_sidebar() {
+  for pid in $(tmux list-panes -a -f '#{@agents_sidebar}' -F '#{@agents_sidebar_pid}' 2>/dev/null); do
+    kill -USR1 "$pid" 2>/dev/null
+  done
+}
+
+# Panes you are looking at: the active pane of each attached session's
+# current window, or the previously active one when the sidebar has focus.
+viewed_panes() {
+  sb_windows=" $(tmux list-panes -a -f '#{&&:#{pane_active},#{@agents_sidebar}}' -F '#{window_id}' 2>/dev/null | tr '\n' ' ') "
+  tmux list-panes -a -f '#{&&:#{window_active},#{session_attached}}' \
+    -F '#{pane_id} #{window_id} #{pane_active} #{pane_last} #{@agents_sidebar}' 2>/dev/null |
+    while read -r p w active last sidebar; do
+      [ "$sidebar" = 1 ] && continue
+      case "$sb_windows" in
+        *" $w "*) [ "$last" = 1 ] && echo "$p" ;;
+        *) [ "$active" = 1 ] && echo "$p" ;;
+      esac
+    done
+}
+
+# "#rrggbb" -> ANSI 24-bit foreground escape
+fg() {
+  h=${1#\#}
+  printf '\033[38;2;%d;%d;%dm' "$((0x$(printf %.2s "$h")))" \
+    "$((0x$(printf %s "$h" | cut -c3-4)))" "$((0x$(printf %s "$h" | cut -c5-6)))"
+}
+
+state_color() {
+  case "$1" in blocked | done | working) opt "@agents-color-$1" ;; *) opt @agents-color-idle ;; esac
+}
+
+agent_icon() {
+  case "$1" in claude | opencode | codex) opt "@agents-icon-$1" ;; *) opt @agents-icon-agent ;; esac
+}
+
+# --- notifications -----------------------------------------------------------
+
+# toast <state> <agent> <name> <text> <where>
+# Toast: a small floating pane in the top-right corner of the window you are
+# looking at, created with -d so it never takes the keyboard; it closes
+# itself. Sidebar banner: blinks at the sidebar bottom for 3 s.
+cmd_toast() {
+  style=$(opt @agents-notify) # toast | sidebar | both | off
+  [ "$style" = off ] && return 0
+  state=$1 agent=$2 name=$3 text=$4 where=$5
+  if [ "$style" = sidebar ] || [ "$style" = both ]; then
+    # Separate options (one atomic tmux command), so no separator can clash
+    # with a name; the id goes last and tells the sidebar it is new.
+    tmux set -g @agents_flash_state "$state" \; set -g @agents_flash_agent "$agent" \
+      \; set -g @agents_flash_name "$name" \; set -g @agents_flash_text "$text" \
+      \; set -g @agents_flash_where "$where" \; set -g @agents_flash_id "$(date +%s)$$"
+    poke_sidebar
+  fi
+  [ "$style" = sidebar ] && return 0
+
+  # The most recently active client and the window it shows.
+  line=$(tmux list-clients -F '#{client_activity} #{window_id} #{window_width} #{client_name}' 2>/dev/null | sort -rn | head -n 1)
+  [ -n "$line" ] || return 0
+  win=$(echo "$line" | cut -d' ' -f2)
+  ww=$(echo "$line" | cut -d' ' -f3)
+  client=$(echo "$line" | cut -d' ' -f4-)
+  w=$(opt @agents-toast-width)
+  [ "$w" -gt $((ww - 4)) ] && w=$((ww - 4))
+  # First free 4-row slot from the top (toasts close in any order).
+  tops=$(tmux list-panes -t "$win" -f '#{@agents_toast}' -F '#{pane_top}' 2>/dev/null | tr '\n' ' ')
+  slot=0
+  while [ "$slot" -lt 8 ]; do
+    taken=0
+    for t in $tops; do
+      if [ "$t" -ge $((slot * 4)) ] && [ "$t" -lt $((slot * 4 + 4)) ]; then taken=1; fi
+    done
+    [ "$taken" = 0 ] && break
+    slot=$((slot + 1))
+  done
+  col=$(state_color "$state")
+  id=$(tmux new-pane -d -A -P -F '#{pane_id}' -t "$win" \
+    -x "$w" -y 4 -X $((ww - w - 1)) -Y $((slot * 4)) -B "$(opt @agents-toast-border)" \
+    -s "bg=$(opt @agents-color-bg)" -S "fg=$col" -R "fg=$col" \
+    "exec '$ROOT/bin/tmux-agents' toast-body '$state' '$agent' '$(printf '%s' "$name" | tr -d "'")' '$(printf '%s' "$text" | tr -d "'")' '$where'" \
+    2>/dev/null)
+  if [ -n "$id" ]; then
+    tmux set -p -t "$id" @agents_toast 1
+  else # tmux without floating panes
+    # Doubled "#" so a window or folder name is shown, not expanded.
+    tmux display-message -c "$client" -d 2500 "$(printf '%s' "$name: $text ($where)" | sed 's/#/##/g')"
+  fi
+}
+
+# toast-body: what runs inside the toast pane.
+cmd_toast_body() {
+  state=$1 agent=$2 name=$3 text=$4 where=$5
+  col=$(state_color "$state")
+  case "$state" in
+    blocked | done) icon=$(opt "@agents-icon-$state") ;;
+    *) icon=$(opt @agents-icon-idle) ;;
+  esac
+  printf '\033[?25l'
+  printf ' %s%s \033[1m%s%s\033[0m\n' "$(fg "$col")" "$(agent_icon "$agent")" "$(fg "$(opt @agents-color-text)")" "$name"
+  printf ' %s%s %s\033[0m  %s%s %s\033[0m' "$(fg "$col")" "$icon" "$text" \
+    "$(fg "$(opt @agents-color-muted)")" "$(opt @agents-icon-window)" "$where"
+  sleep "$(opt @agents-toast-seconds)"
+}
+
+# --- commands ----------------------------------------------------------------
+
+# report <state> [agent] [note]   (pane: $TMUX_PANE or $TMUX_AGENTS_PANE)
+cmd_report() {
+  state=${1:-}
+  agent=${2:-}
+  note=${3:-}
+  pane=${TMUX_AGENTS_PANE:-${TMUX_PANE:-}}
+  [ -n "$pane" ] && [ -n "$state" ] || exit 0
+
+  # One round trip for everything we need to decide.
+  info=$(tmux display -p -t "$pane" \
+    '#{@agent_state}|#{@agent}|#{@agent_note}|#{session_id}|#{window_index}|#{?#{automatic-rename},#{b:pane_current_path},#{window_name}}' \
+    2>/dev/null) || exit 0
+  prev=${info%%|*}; rest=${info#*|}
+  prev_agent=${rest%%|*}; rest=${rest#*|}
+  prev_note=${rest%%|*}; rest=${rest#*|}
+  sess=${rest%%|*}; rest=${rest#*|}
+  where=${rest%%|*}
+  name=${rest#*|} # last: may contain "|"
+  [ -n "$agent" ] || agent=${prev_agent:-agent}
+
+  # A finished turn you are looking at, in a focused terminal showing this
+  # session, is already seen.
+  focused=0
+  case "$state" in
+    done | blocked)
+      if viewed_panes | grep -qx "$pane" &&
+        tmux list-clients -t "$sess" -F '#{client_flags}' 2>/dev/null | grep -q focused; then
+        focused=1
+      fi ;;
+  esac
+  if [ "$state" = done ] && [ "$focused" = 1 ]; then state=idle; fi
+
+  if [ "$state" = "$prev" ] && [ "$agent" = "$prev_agent" ] && [ "$note" = "$prev_note" ]; then
+    exit 0 # nothing changed: the common PreToolUse case
+  fi
+
+  if [ "$state" = "$prev" ]; then
+    tmux set -p -t "$pane" @agent "$agent" \; set -p -t "$pane" @agent_note "$note"
+  else
+    tmux set -p -t "$pane" @agent "$agent" \; set -p -t "$pane" @agent_state "$state" \
+      \; set -p -t "$pane" @agent_since "$(date +%s)" \; set -p -t "$pane" @agent_note "$note"
+    update_window "$pane"
+  fi
+  poke_sidebar
+
+  notify_on=" $(opt @agents-notify-on) "
+  if [ "$state" != "$prev" ] && [ "$focused" = 0 ] && [ "${notify_on#* "$state" }" != "$notify_on" ]; then
+    case "$state" in
+      done) cmd_toast done "$agent" "$name" "finished" "$where" >/dev/null 2>&1 & ;;
+      blocked) cmd_toast blocked "$agent" "$name" "${note:-needs your input}" "$where" >/dev/null 2>&1 & ;;
+    esac
+  fi
+}
+
+# Unset the agent options of one pane (no window update).
+forget_pane() {
+  tmux set -pu -t "$1" @agent \; set -pu -t "$1" @agent_state \; set -pu -t "$1" @agent_since \
+    \; set -pu -t "$1" @agent_note \; set -pu -t "$1" @agent_shell_since 2>/dev/null
+}
+
+# clear [pane]: forget the agent in a pane (agent exited).
+cmd_clear() {
+  pane=${1:-${TMUX_AGENTS_PANE:-${TMUX_PANE:-}}}
+  [ -n "$pane" ] || exit 0
+  forget_pane "$pane"
+  update_all_windows # the pane may already be gone
+  poke_sidebar
+}
+
+# seen: called from tmux focus hooks; done -> idle for the pane you now see.
+cmd_seen() {
+  now=$(date +%s)
+  for p in $(viewed_panes); do
+    [ "$(tmux display -p -t "$p" '#{@agent_state}')" = done ] || continue
+    tmux set -p -t "$p" @agent_state idle \; set -p -t "$p" @agent_since "$now"
+    update_window "$p"
+  done
+  poke_sidebar
+}
+
+# sweep: housekeeping, run from tmux hooks, the status line and the sidebar.
+#  - an agent whose pane has been back at a shell for STALE_SECONDS exited
+#    without a hook (crash, kill): forget it
+#  - recompute every window's tab state (also covers killed panes)
+#  - close a sidebar left alone in its window
+#  - restore tmux's border in windows the sidebar left (sync_borders)
+cmd_sweep() {
+  now=$(date +%s)
+  changed=0
+  # Here-doc, not a pipe: the loop must run in this shell to set $changed.
+  while read -r p cmd since; do
+    [ -n "$p" ] || continue
+    case "$SHELLS" in
+      *" $cmd "*)
+        if [ -z "$since" ]; then
+          tmux set -p -t "$p" @agent_shell_since "$now"
+        elif [ $((now - since)) -ge "$STALE_SECONDS" ]; then
+          forget_pane "$p"
+          changed=1
+        fi ;;
+      *) [ -n "$since" ] && tmux set -pu -t "$p" @agent_shell_since ;;
+    esac
+  done <<EOF
+$(tmux list-panes -a -f '#{@agent}' -F '#{pane_id} #{pane_current_command} #{@agent_shell_since}' 2>/dev/null)
+EOF
+  update_all_windows
+  for p in $(tmux list-panes -a -f '#{&&:#{@agents_sidebar},#{==:#{window_panes},1}}' -F '#{pane_id}' 2>/dev/null); do
+    tmux kill-pane -t "$p"
+  done
+  sync_borders
+  [ "$changed" = 1 ] && poke_sidebar
+  return 0
+}
+
+# agent-hook <agent>: Claude Code / Codex hook entry point; hook JSON on stdin.
+# Both send the same field names (hook_event_name, tool_name); codex has no
+# notification_type, claude has no status. The prompt text and error messages
+# are deliberately never read.
+cmd_agent_hook() {
+  agent=$1
+  [ -n "${TMUX_PANE:-}" ] || { cat >/dev/null; exit 0; }
+  command -v jq >/dev/null 2>&1 || { cat >/dev/null; exit 0; }
+  # One jq call: event, tool name, notification type, request status (tab separated).
+  fields=$(jq -r '[.hook_event_name // "", .tool_name // "", .notification_type // "", (.status // "" | tostring)] | @tsv' 2>/dev/null) || exit 0
+  tab=$(printf '\t')
+  event=${fields%%"$tab"*}; rest=${fields#*"$tab"}
+  tool=${rest%%"$tab"*}; rest=${rest#*"$tab"}
+  ntype=${rest%%"$tab"*}
+  status=${rest#*"$tab"}
+  case "$agent:$event" in
+    claude:SessionStart) cmd_report idle claude ;;
+    claude:UserPromptSubmit) cmd_report working claude ;;
+    claude:PreToolUse)
+      case "$tool" in
+        AskUserQuestion) cmd_report blocked claude "asking a question" ;;
+        ExitPlanMode) cmd_report blocked claude "plan ready for review" ;;
+        *) cmd_report working claude ;;
+      esac ;;
+    claude:PostToolUse) cmd_report working claude ;;
+    claude:Notification)
+      case "$ntype" in
+        permission_prompt) cmd_report blocked claude "needs approval" ;;
+        elicitation_dialog) cmd_report blocked claude "needs input" ;;
+        idle_prompt)
+          # Claude has waited 60 s for input. A turn interrupted with Esc
+          # fires no Stop hook, so a pane still "working" is really idle.
+          [ "$(tmux show -pqv -t "$TMUX_PANE" @agent_state 2>/dev/null)" = working ] &&
+            cmd_report idle claude ;;
+        *) : ;; # auth_success: no state change
+      esac ;;
+    claude:Stop) cmd_report done claude ;;
+    claude:SessionEnd) cmd_clear ;;
+    codex:SessionStart) cmd_report idle codex ;;
+    codex:PreToolUse)
+      case "$tool" in
+        request_user_input) cmd_report blocked codex "asking a question" ;;
+        *) cmd_report working codex ;;
+      esac ;;
+    codex:UserPromptSubmit | codex:PostToolUse) cmd_report working codex ;;
+    # A model request that fails ends the turn without a Stop hook (the card
+    # would stay "working"). A retried attempt starts with PreModelRequest, but
+    # only a blocked card is brought back: requests made outside a turn
+    # (compaction, titles) must not turn a finished card into "working".
+    codex:PreModelRequest)
+      [ "$(tmux show -pqv -t "$TMUX_PANE" @agent_state 2>/dev/null)" = blocked ] &&
+        cmd_report working codex ;;
+    codex:PostModelRequest)
+      [ "$status" = failed ] && cmd_report blocked codex "request failed" ;;
+    codex:PermissionRequest) cmd_report blocked codex "needs approval" ;;
+    codex:Stop) cmd_report done codex ;;
+    codex:Interrupt)
+      # Turn cut short (Esc): no Stop fires, so go idle right away.
+      cmd_report idle codex ;;
+    codex:SessionEnd) cmd_clear ;;
+  esac
+  exit 0
+}
+
+# sidebar toggle|open|follow|save [session_id] [window_id]
+# One sidebar pane per session; a global flag remembers it is switched on, so
+# it follows you across windows and sessions. The width you drag it to is
+# saved (@agents_sidebar_width_saved) and reused everywhere.
+cmd_sidebar() {
+  action=${1:-toggle}
+  width=$(tmux show -gqv @agents_sidebar_width_saved)
+  [ -n "$width" ] || width=$(opt @agents-sidebar-width)
+  # Session/window come from the tmux hook; default to the current client's.
+  sess=${2:-$(tmux display -p '#{session_id}')}
+  here=${3:-$(tmux display -p -t "$sess" '#{window_id}')}
+  sb=$(tmux list-panes -s -t "$sess" -f '#{@agents_sidebar}' -F '#{pane_id}' 2>/dev/null | head -n 1)
+  case "$action" in
+    toggle)
+      if [ -n "$sb" ]; then
+        tmux set -gu @agents_sidebar_on
+        # Close the sidebar in every session.
+        for p in $(tmux list-panes -a -f '#{@agents_sidebar}' -F '#{pane_id}'); do
+          tmux kill-pane -t "$p"
+        done
+        sync_borders
+      else
+        tmux set -g @agents_sidebar_on 1
+        cmd_sidebar open "$sess" "$here"
+      fi ;;
+    open)
+      [ -n "$sb" ] && return 0
+      # Mark the pane at once (the sidebar marks itself too, once bun is up),
+      # so sync_borders and other callers see it immediately.
+      new=$(tmux split-window -hbf -d -P -F '#{pane_id}' -l "$width" -t "$here" \
+        "exec bun '$ROOT/sidebar/sidebar.ts'")
+      [ -n "$new" ] && tmux set -p -t "$new" @agents_sidebar 1
+      dedupe_sidebars "$sess"
+      sync_borders ;;
+    follow)
+      [ "$(tmux show -gqv @agents_sidebar_on)" = 1 ] || return 0
+      # Hooks run in the background and can finish out of order: go to the
+      # window the session shows now, not the one the hook saw.
+      here=$(tmux display -p -t "$sess" '#{window_id}' 2>/dev/null) || return 0
+      if [ -z "$sb" ]; then cmd_sidebar open "$sess" "$here"; return 0; fi
+      [ "$(tmux display -p -t "$sb" '#{window_id}')" = "$here" ] && return 0
+      [ "$(tmux display -p -t "$here" '#{window_zoomed_flag}')" = 1 ] && return 0
+      target=$(tmux list-panes -t "$here" -f '#{!=:#{pane_floating_flag},1}' -F '#{pane_id}' | head -n 1)
+      tmux join-pane -hbf -d -l "$width" -s "$sb" -t "$target"
+      sync_borders ;;
+    save)
+      # After a resize in window $3: remember the sidebar's width, if it is there.
+      w=$(tmux list-panes -t "$here" -f '#{@agents_sidebar}' -F '#{pane_width}' 2>/dev/null | head -n 1)
+      [ -n "$w" ] && [ "$w" -ge 12 ] && tmux set -g @agents_sidebar_width_saved "$w" ;;
+  esac
+}
+
+case "${1:-}" in
+  report) shift; cmd_report "$@" ;;
+  clear) shift; cmd_clear "$@" ;;
+  seen) cmd_seen ;;
+  sweep)
+    # From the status line: skip while a sidebar runs, it sweeps every second.
+    if [ "${2:-}" = status ] && [ -n "$(tmux list-panes -a -f '#{@agents_sidebar}' -F x 2>/dev/null)" ]; then exit 0; fi
+    cmd_sweep ;;
+  claude-hook) cmd_agent_hook claude ;;
+  codex-hook) cmd_agent_hook codex ;;
+  sidebar) shift; cmd_sidebar "$@" ;;
+  toast) shift; cmd_toast "$@" ;;
+  toast-body) shift; cmd_toast_body "$@" ;;
+  *)
+    echo "usage: tmux-agents report <working|blocked|done|idle> [agent] [note]" >&2
+    echo "       tmux-agents clear [pane] | seen | sweep | claude-hook | codex-hook" >&2
+    echo "       tmux-agents sidebar [toggle|open|follow|save]" >&2
+    echo "       tmux-agents toast <state> <agent> <name> <text> <where>" >&2
+    exit 2 ;;
+esac

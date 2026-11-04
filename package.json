@@ -1,0 +1,13 @@
+{
+  "name": "tmux-agents",
+  "private": true,
+  "version": "0.1.0",
+  "description": "herdr-style Agents sidebar, tab icons and notifications for tmux (Claude Code + OpenCode)",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "sidebar": "bun sidebar/sidebar.ts",
+    "check": "sh -n bin/tmux-agents && sh -n tmux-agents.tmux && sh -n install.sh && sh -n tests/install.sh && bun build sidebar/sidebar.ts opencode/tui.js --target bun --outdir /tmp/tmux-agents-check >/dev/null && echo ok",
+    "test": "bun test tests"
+  }
+}
