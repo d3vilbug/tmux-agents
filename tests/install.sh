@@ -37,7 +37,9 @@ mkbin() {
 }
 X() { "$REAL_TMUX" -L "$SOCK" "$@"; }
 tmux_down() { X kill-server 2>/dev/null; true; }
-tmux_up() { tmux_down; PATH="$B:/usr/bin:/bin" X -f /dev/null new -d -s t; }
+# The server gets a dummy HOME: a "~" in a config it sources (e.g. TPM's run
+# line) must never reach the real home of whoever runs the tests.
+tmux_up() { tmux_down; mkdir -p "$W/srvhome"; HOME="$W/srvhome" PATH="$B:/usr/bin:/bin" X -f /dev/null new -d -s t; }
 sums() { find "$H" -type f ! -name '*.bak-*' | sort | while IFS= read -r f; do cksum "$f"; done; }
 run() { env -i HOME="$H" PATH="$B:/usr/bin:/bin" TMPDIR="$TMPDIR" TMUX_TMPDIR="$TS" "$SHB" "$R/install.sh" "$@" >"$W/out" 2>&1; }
 # BSD stat takes -f, GNU stat takes -c (on GNU, -f means "filesystem status").
@@ -89,7 +91,8 @@ t "B codex config kept" 'grep -q "^model = \"gpt-5\"$" "$H/.codex/config.toml" &
 t "B codex features before next section" '[ "$(grep -n "^hooks = true" "$H/.codex/config.toml" | cut -d: -f1)" -lt "$(grep -n "^\[tui\]" "$H/.codex/config.toml" | cut -d: -f1)" ]'
 t "B 5 backups" '[ "$(ls "$H"/.tmux.conf.bak-* "$H"/.claude/settings.json.bak-* "$H"/.config/opencode/cli.json.bak-* "$H"/.codex/hooks.json.bak-* "$H"/.codex/config.toml.bak-* 2>/dev/null | wc -l | tr -d " ")" = 5 ]'
 t "B key bound" 'X list-keys -T prefix a | grep -q "sidebar toggle"'
-t "B tmux hooks 90-93" '[ "$(X show-hooks -g | grep -c "\[9[0-3]\]")" -ge 7 ] && X show-hooks -gw | grep -q "pane-exited\[92\]"'
+t "B tmux hooks 90-93" '[ "$(X show-hooks -g | grep -c "\[9[0-3]\]")" -ge 7 ] && X show-hooks -gw | grep -q "pane-exited\[92\]" && X show-hooks -gw | grep -q "pane-moved\[95\]" && X show-hooks -gw | grep -q "window-resized\[96\].*resize-pane"'
+t "B follow hooks move the sidebar in the hook (no flash)" 'X show-hooks -g "session-window-changed[90]" | grep -q "join-pane" && X show-hooks -g "client-session-changed[90]" | grep -q "join-pane" && X show-hooks -g "session-window-changed[90]" | grep -q "sidebar follow"'
 t "B status-right sweep" 'X show -gv status-right | grep -q "sweep status"'
 t "B tab icon in formats" 'X show -gwv window-status-format | grep -q "@agents-tab-icon"'
 t "B no key conflict reported" '! grep -q "already bound" "$W/out"'
@@ -112,6 +115,19 @@ t "C no new backups" '[ "$(ls "$H"/.claude/*.bak-* | wc -l)" = "$nb" ]'
 t "C reports already" 'grep -q "hooks already in" "$W/out" && grep -q "already in $H/.tmux.conf" "$W/out" && grep -qF "hooks already in $H/.codex/hooks.json" "$W/out"'
 t "C no other installs" 'grep -A1 "Other tmux-agents" "$W/out" | grep -q none'
 t "C own live binding is no conflict" '! grep -q "already bound" "$W/out"'
+
+echo "C2. re-running restarts open sidebars on the new code"
+SBX=$(X new-window -d -P -F '#{pane_id}' -t t 'exec sleep 600'); X set -p -t "$SBX" @agents_sidebar 1   # an "old" sidebar
+run --dry-run
+t "C2 dry run lists the restart" 'grep -q "would: restart 1 open sidebar" "$W/out"'
+t "C2 dry run leaves the sidebar alone" 'X display -p -t "$SBX" "#{pane_start_command}" | grep -q "sleep 600"'
+run; rc=$?
+if [ -n "$REAL_BUN" ]; then
+  t "C2 sidebar restarted in place on this copy" '[ $rc = 0 ] && grep -q "restarted 1 open sidebar" "$W/out" && X display -p -t "$SBX" "#{pane_start_command}" | grep -qF "$R/sidebar/sidebar.ts" && [ "$(X display -p -t "$SBX" "#{pane_dead}:#{@agents_sidebar}")" = "0:1" ]'
+else
+  t "C2 no bun: sidebar left, user told" 'grep -q "bun not found" "$W/out"'
+fi
+X kill-pane -t "$SBX"
 
 echo "D. the installed hook drives tmux state"
 P=$(X list-panes -t t -F "#{pane_id}")
@@ -161,7 +177,17 @@ X set -p -t "$SB" @agents_sidebar 1; X set -g @agents_sidebar_on 1      # fake o
 X split-window -d -t t 'exec sleep 600'; TO=$(X list-panes -t t -F '#{pane_id}' | tail -n 1)
 X set -p -t "$TO" @agents_toast 1                                       # fake toast
 WIN=$(X display -p -t "$SB" '#{window_id}'); X set -w -t "$WIN" pane-active-border-style fg=red; X set -w -t "$WIN" @agents_border_hidden 1
+# A window whose own border style the sidebar hid: it comes back.
+BW=$(X new-window -d -P -F '#{window_id}' -t t: 'exec sleep 600'); X set -w -t "$BW" pane-active-border-style fg=yellow
+X set -w -t "$BW" @agents_border_saved fg=yellow; X set -w -t "$BW" pane-active-border-style fg=grey; X set -w -t "$BW" @agents_border_hidden fg=grey
 X set -g @agents_flash_id 123; X set -g @agents-notify-on blocked       # runtime + a user setting
+# An active sidebar-aware zoom: fake sidebar + 2 panes, the right one moved out.
+X set -g @agents-zoom-keeps-sidebar on; X run-shell "'$R/tmux-agents.tmux'"
+ZL=$(X new-window -d -P -F '#{pane_id}' -t t: 'exec sleep 600'); ZW=$(X display -p -t "$ZL" '#{window_id}')
+ZR=$(X split-window -d -h -P -F '#{pane_id}' -t "$ZL" 'exec sleep 600')
+ZS=$(X split-window -hbf -d -l 22 -P -F '#{pane_id}' -t "$ZL" 'exec sleep 600'); X set -p -t "$ZS" @agents_sidebar 1
+env -i HOME="$H" PATH="$B:/usr/bin:/bin" TMUX_TMPDIR="$TS" TMUX="$SOCKPATH,1,0" "$R/bin/tmux-agents" zoom toggle "$ZW" "$ZL"
+t "E zoom active before uninstall" '[ "$(X display -p -t "$ZR" "#{session_name}")" = _agents_zoom ] && X list-keys -T prefix z | grep -q "zoom toggle"'
 run --uninstall; rc=$?
 t "E exit 0" '[ $rc = 0 ]'
 t "E settings.json restored" '[ "$(jq -cS . "$H/.claude/settings.json")" = "$(jq -cS . "$W/orig-settings.json")" ]'
@@ -173,13 +199,17 @@ t "E tmux.conf byte-identical to original" 'cmp -s "$W/dots/tmux.conf" "$W/orig-
 t "E sidebar and toast panes closed" '! X list-panes -a -F "#{pane_id}" | grep -qx -e "$SB" -e "$TO"'
 t "E pane state cleared" '[ -z "$(X display -p -t "$P" "#{@agent}#{@agent_state}#{@agent_since}")" ]'
 t "E window state cleared" '[ -z "$(X list-windows -a -F "#{@agent_win_state}#{@agent_win_agent}#{@agents_border_hidden}" | tr -d "\n")" ]'
+t "E your own border style back" '[ "$(X show -wv -t "$BW" pane-active-border-style)" = fg=yellow ] && [ -z "$(X show -wqv -t "$BW" @agents_border_saved)" ]'
 t "E hidden border restored" '! X list-windows -a -F "#{window_id}" | while read -r w; do X show -wv -t "$w" pane-active-border-style 2>/dev/null; done | grep -q red'
 t "E runtime globals cleared" '! X show -g | grep -q -e "^@agents_" -e "^@agents-tab-icon"'
 t "E user settings kept" '[ "$(X show -gv @agents-notify-on)" = blocked ]'
+t "E zoom undone: moved pane back home" '[ "$(X display -p -t "$ZR" "#{window_id}")" = "$ZW" ] && ! X list-sessions -F "#{session_name}" | grep -qx _agents_zoom'
+t "E prefix + z is tmux zoom again" 'X list-keys -T prefix z | grep -q "resize-pane -Z"'
+t "E zoom state cleared" '[ -z "$(X display -p -t "$ZW" "#{@agents_zoom}#{@agents_zoom_layout}")$(X show -gqv @agents_zoom_bound)" ]'
 t "E restart warning for running Claude sessions" 'grep -q "keep calling the hook until restarted" "$W/out"'
 t "E tmux.conf still a symlink" '[ -L "$H/.tmux.conf" ]'
 t "E key unbound" '! X list-keys -T prefix a 2>/dev/null | grep -q "sidebar toggle"'
-t "E tmux hooks removed" '[ "$(X show-hooks -g | grep -c "\[9[0-3]\]")" = 0 ]'
+t "E tmux hooks removed" '[ "$(X show-hooks -g | grep -c "\[9[0-3]\]")" = 0 ] && ! X show-hooks -gw | grep -q "\[9[0-6]\]"'
 run --uninstall; rc=$?
 t "E second uninstall is harmless" '[ $rc = 0 ] && grep -q "not in" "$W/out"'
 
@@ -295,6 +325,64 @@ t "J2 table at end of file: blank lines kept after hooks" '[ "$(od -c "$H/.codex
 H=$W/cx9; mkdir -p "$H/.codex"; run $CX
 t "J2 created config.toml starts with [features]" '[ "$(head -n 1 "$H/.codex/config.toml")" = "[features]" ]'
 
+echo "T. TPM: plugin line, setup popup, uninstall"
+TPMCONF='set -g @plugin '"'"'tmux-plugins/tpm'"'"'\nset -g @plugin '"'"'d3vilbug/tmux-agents'"'"'\nrun '"'"'~/.tmux/plugins/tpm/tpm'"'"'\n'
+H=$W/tpm; mkdir -p "$H/.claude"; printf "$TPMCONF" >"$H/.tmux.conf"; cp "$H/.tmux.conf" "$W/tpm.conf"
+run --no-claude --no-codex --no-opencode
+t "T TPM-managed: no run-shell line added" 'cmp -s "$H/.tmux.conf" "$W/tpm.conf" && grep -q "loaded by TPM" "$W/out"'
+printf 'run-shell "%s/tmux-agents.tmux"\n' "$R" >>"$H/.tmux.conf"
+run --no-claude --no-codex --no-opencode
+t "T TPM plus run-shell line: warned it loads twice" 'grep -q "it loads twice" "$W/out"'
+cp "$W/tpm.conf" "$H/.tmux.conf"
+env -i HOME="$H" PATH="$B:/usr/bin:/bin" TMPDIR="$TMPDIR" TMUX_TMPDIR="$TS" "$SHB" "$R/install.sh" --check-setup; rc=$?
+t "T check-setup: hooks missing -> 0" '[ $rc = 0 ]'
+printf 'n\n\n' | run --setup
+t "T setup, not now: nothing changed" '! grep -q tmux-agents "$H/.claude/settings.json" 2>/dev/null && cmp -s "$H/.tmux.conf" "$W/tpm.conf" && grep -q "Not now" "$W/out"'
+printf 'y\n\n' | run --setup
+t "T setup, yes: claude hooks added" '[ "$(jq --arg c "$OURCMD" "[.hooks[][] | select(.hooks[0].command == \$c)] | length" "$H/.claude/settings.json")" = 7 ]'
+t "T setup, yes: tmux.conf untouched" 'cmp -s "$H/.tmux.conf" "$W/tpm.conf"'
+env -i HOME="$H" PATH="$B:/usr/bin:/bin" TMPDIR="$TMPDIR" TMUX_TMPDIR="$TS" "$SHB" "$R/install.sh" --check-setup; rc=$?
+t "T check-setup: all connected -> 1" '[ $rc = 1 ]'
+printf '\n' | run --setup
+t "T setup with nothing to do says so" 'grep -q "Nothing to do" "$W/out"'
+H=$W/tpm2; mkdir -p "$H/.claude"; printf "$TPMCONF" >"$H/.tmux.conf"
+printf 'x\n\n' | run --setup
+t "T setup, never: opt-out line before the TPM run line" '[ "$(grep -n "@agents-setup-prompt off" "$H/.tmux.conf" | cut -d: -f1)" -lt "$(grep -n "tpm/tpm" "$H/.tmux.conf" | cut -d: -f1)" ] && ! [ -s "$H/.claude/settings.json" ]'
+# The popup trigger (bin/tmux-agents setup-prompt) against the test server.
+tmux_up
+SP() { env -i HOME="$H" PATH="$B:/usr/bin:/bin" TMPDIR="$TMPDIR" TMUX_TMPDIR="$TS" TMUX="$(X display -p '#{socket_path}'),1,0" "$R/bin/tmux-agents" setup-prompt nosuchclient; }
+H=$W/tpm3; mkdir -p "$H/.claude"; printf "$TPMCONF" >"$H/.tmux.conf"
+SP
+t "T prompt: TPM user with hooks missing is asked (once)" '[ "$(X show -gqv @agents_setup_prompted)" = 1 ]'
+X set -gu @agents_setup_prompted; X set -g @agents-setup-prompt off; SP
+t "T prompt: opted out -> not asked" '[ -z "$(X show -gqv @agents_setup_prompted)" ]'
+X set -gu @agents-setup-prompt
+printf 'run-shell "%s/tmux-agents.tmux"\n' "$R" >"$H/.tmux.conf"; SP
+t "T prompt: install.sh user -> not asked" '[ -z "$(X show -gqv @agents_setup_prompted)" ]'
+# A fake TPM that does what TPM does: run every plugin's *.tmux file.
+H=$W/tpm; mkdir -p "$H/.tmux/plugins/tpm"; printf '#!/bin/sh\n"%s/tmux-agents.tmux"\n' "$R" >"$H/.tmux/plugins/tpm/tpm"; chmod +x "$H/.tmux/plugins/tpm/tpm"
+# Its run line by absolute path (the server's ~ is the dummy HOME).
+printf 'set -g @plugin %s\nrun %s\n' "'d3vilbug/tmux-agents'" "'$H/.tmux/plugins/tpm/tpm'" >"$H/.tmux.conf"
+tmux_up; X source-file "$H/.tmux.conf"
+t "T loaded through (fake) TPM: key, hooks, in-hook sidebar move" 'X list-keys -T prefix a | grep -q "sidebar toggle" && X show-hooks -g "session-window-changed[90]" | grep -q "join-pane" && X show-hooks -g | grep -q "client-attached\[94\]"'
+run --uninstall --no-claude --no-codex --no-opencode
+t "T uninstall: told to remove the @plugin line" 'grep -q "remove the @plugin line" "$W/out"'
+t "T uninstall: client-attached hook removed" '! X show-hooks -g | grep -q "client-attached\[94\]"'
+t "T uninstall with the @plugin line still there: not reloaded by TPM" '! X list-keys -T prefix a 2>/dev/null | grep -q "sidebar toggle" && [ "$(X show-hooks -g | grep -c "\[9[0-4]\]")" = 0 ] && ! X show -gv status-right | grep -q "sweep status" && ! X show -gwv window-status-format | grep -q agents-tab-icon'
+# --setup --dry-run writes nothing; x twice adds the opt-out line once.
+H=$W/tpm4; mkdir -p "$H/.claude"; printf "$TPMCONF" >"$H/.tmux.conf"; cp "$H/.tmux.conf" "$W/tpm4.conf"
+printf 'y\n\n' | run --setup --dry-run
+t "T setup --dry-run, yes: nothing written" '! [ -s "$H/.claude/settings.json" ] && cmp -s "$H/.tmux.conf" "$W/tpm4.conf"'
+printf 'x\n\n' | run --setup --dry-run
+t "T setup --dry-run, never: tmux.conf untouched" 'cmp -s "$H/.tmux.conf" "$W/tpm4.conf"'
+printf 'x\n\n' | run --setup; printf 'x\n\n' | run --setup
+t "T setup, never twice: one opt-out line" '[ "$(grep -c "@agents-setup-prompt off" "$H/.tmux.conf")" = 1 ] && grep -q "already off" "$W/out"'
+# Another plugin whose name only starts with tmux-agents is not this one.
+H=$W/tpm5; mkdir -p "$H"; printf "set -g @plugin 'someone/tmux-agents-extra'\n" >"$H/.tmux.conf"
+run --no-claude --no-codex --no-opencode
+t "T @plugin of tmux-agents-extra is not TPM-managed" 'grep -qF "run-shell" "$H/.tmux.conf" && ! grep -q "loaded by TPM" "$W/out"'
+tmux_down
+
 echo "K. errors and options"
 H=$W/notmux; mkdir -p "$H"; Bfull=$B
 # A PATH with no tmux at all (Linux ships one in /usr/bin; a stock macOS does
@@ -308,6 +396,33 @@ run --bogus; rc=$?
 t "K bad option: exit 2" '[ $rc = 2 ]'
 run --help
 t "K help" 'grep -q -- "--dry-run" "$W/out"'
+
+echo "M. edge cases: read-only files, whitespace JSON, XDG elsewhere, no jq, if-shell @plugin, CRLF, a key bound by hand"
+H=$W/ro; mkdir -p "$H/.claude"; echo '{}' >"$H/.claude/settings.json"; chmod 444 "$H/.claude/settings.json"
+run --no-tmux --no-codex --no-opencode; rc=$?
+t "M read-only settings.json: exit 1, says so, no false success" '[ $rc = 1 ] && grep -q "cannot write $H/.claude/settings.json" "$W/out" && ! grep -q "✓ add the Claude hooks\|✓ hooks already" "$W/out" && [ "$(cat "$H/.claude/settings.json")" = "{}" ]'
+chmod 644 "$H/.claude/settings.json"
+H=$W/ws; mkdir -p "$H/.claude"; printf '\n  \n' >"$H/.claude/settings.json"
+run --no-tmux --no-codex --no-opencode
+t "M whitespace-only settings.json: hooks added in one run" '[ "$(jq --arg c "$OURCMD" "[.hooks[][] | select(.hooks[0].command == \$c)] | length" "$H/.claude/settings.json")" = 7 ]'
+H=$W/xdg2; mkdir -p "$H/.config/tmux" "$H/xdg"; echo 'set -g mouse on' >"$H/.config/tmux/tmux.conf"
+env -i HOME="$H" XDG_CONFIG_HOME="$H/xdg" PATH="$B:/usr/bin:/bin" TMPDIR="$TMPDIR" TMUX_TMPDIR="$TS" "$SHB" "$R/install.sh" --no-claude --no-codex --no-opencode >"$W/out" 2>&1
+t "M XDG_CONFIG_HOME elsewhere: ~/.config/tmux/tmux.conf used, no new ~/.tmux.conf" 'grep -qF "$R/tmux-agents.tmux" "$H/.config/tmux/tmux.conf" && [ ! -e "$H/.tmux.conf" ]'
+# No jq: a PATH with only the tools install.sh needs (some systems ship /usr/bin/jq).
+H=$W/nojq; mkdir -p "$H/.claude"; run --no-tmux --no-codex --no-opencode
+B2=$W/bin-nojq; mkdir -p "$B2"; cp "$B/tmux" "$B2/tmux"
+for tool in sh dirname sed date mktemp rm grep cat cp mkdir cmp diff tr cut head tail wc awk printf ls sort; do p=$(command -v "$tool") && [ "${p#/}" != "$p" ] && ln -sf "$p" "$B2/$tool"; done
+env -i HOME="$H" PATH="$B2" TMPDIR="$TMPDIR" TMUX_TMPDIR="$TS" "$SHB" "$R/install.sh" --uninstall --no-tmux --no-codex --no-opencode >"$W/out" 2>&1; rc=$?
+t "M uninstall without jq: not reported done, hooks kept, exit 1" '[ $rc = 1 ] && grep -q "jq is needed" "$W/out" && grep -q "Not fully uninstalled" "$W/out" && ! grep -q "can be deleted" "$W/out" && grep -q tmux-agents "$H/.claude/settings.json"'
+H=$W/ifshell; mkdir -p "$H"; printf '%s\n' "if-shell 'true' \"set -g @plugin 'd3vilbug/tmux-agents'\"" >"$H/.tmux.conf"
+run --no-claude --no-codex --no-opencode
+t "M @plugin inside if-shell is not a TPM install: run-shell line added" 'grep -qF "$R/tmux-agents.tmux" "$H/.tmux.conf"'
+H=$W/crlf; mkdir -p "$H"; printf 'set -g @agents-key A\r\nbind A last-window\r\n' >"$H/.tmux.conf"
+run --dry-run --no-claude --no-codex --no-opencode
+t "M CRLF tmux.conf: key read without the CR, conflict found" 'grep -q "prefix + A is already bound" "$W/out" && ! grep -q "prefix + A$(printf "\r")" "$W/out"'
+tmux_up; X bind-key a display-message mine
+H=$W/neverinst; mkdir -p "$H"; run --uninstall --no-claude --no-codex --no-opencode
+t "M uninstall when never installed: a prefix + a bound by hand stays" 'X list-keys -T prefix a | grep -q "display-message mine"'
 
 echo "L. cleanup"
 t "L no temp files left" '[ -z "$(ls -A "$TMPDIR")" ]'

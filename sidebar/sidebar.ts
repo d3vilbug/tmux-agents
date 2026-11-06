@@ -18,7 +18,7 @@ type Agent = {
   pane: string
   session: string
   window: string
-  slot: number // 0-based position among the window's real panes
+  slot: number // position among the window's real panes, from pane-base-index
   windowPanes: number // real panes in the window (no sidebar, no floating)
   agent: string
   state: State
@@ -27,6 +27,7 @@ type Agent = {
   name: string // window name you gave the tab, else the directory
   path: string
   viewing: boolean
+  zoomFrom: string // window id, while the pane is moved out by the sidebar-aware zoom
 }
 
 const self = process.env.TMUX_PANE ?? ""
@@ -125,33 +126,50 @@ const RESET = "\x1b[0m"
 
 // --- data --------------------------------------------------------------------
 
+// Option values and names may hold any character, so tmux replaces control
+// characters (newline, tab, ESC...) in text fields with a space, and fields
+// are split on US (0x1f), which then cannot occur inside one. Rows that still
+// come out malformed are skipped.
+const CTRL = "[\x01-\x1f\x7f]"
+const plain = (name: string) => `#{s/${CTRL}/ /:${name}}`
+const SEP = "\x1f"
 const FIELDS = [
   "#{pane_id}",
-  "#{session_name}",
+  plain("session_name"),
   "#{window_id}",
   "#{window_index}",
   "#{?#{||:#{@agents_sidebar},#{||:#{pane_floating_flag},#{@agents_toast}}},1,0}",
-  "#{@agent}",
-  "#{@agent_state}",
-  "#{@agent_since}",
-  "#{@agent_note}",
-  "#{?#{automatic-rename},,#{window_name}}",
-  "#{pane_current_path}",
+  plain("@agent"),
+  plain("@agent_state"),
+  plain("@agent_since"),
+  plain("@agent_note"),
+  `#{?#{automatic-rename},,${plain("window_name")}}`,
+  plain("pane_current_path"),
   "#{&&:#{window_active},#{session_attached}}",
   "#{pane_active}",
   "#{pane_last}",
   "#{@agents_sidebar}",
-].join("\t")
+  "#{@agents_zoom_from}",
+  "#{pane-base-index}",
+]
+const FORMAT = FIELDS.join(SEP)
+// Whatever tmux let through (older tmux, C1 controls): never print it raw.
+const clean = (s: string | undefined) => (s ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ")
+// One record per line, exactly `n` fields, else dropped.
+const records = (out: string, n: number) =>
+  out
+    .split("\n")
+    .map((l) => l.split(SEP))
+    .filter((f) => f.length === n)
+// Hidden session that holds panes moved out by the sidebar-aware zoom.
+const ZOOM_STASH = "_agents_zoom"
 
 function basename(p: string): string {
   return p.split("/").filter(Boolean).at(-1) ?? "/"
 }
 
 function load(): Agent[] {
-  const rows = tmux("list-panes", "-a", "-F", FIELDS)
-    .split("\n")
-    .filter(Boolean)
-    .map((l) => l.split("\t"))
+  const rows = records(tmux("list-panes", "-a", "-F", FORMAT), FIELDS.length).map((f) => f.map(clean))
   // Real panes per window, in index order, so "2.1" ignores the sidebar.
   const real = new Map<string, string[]>()
   // Windows whose active pane is the sidebar: you look at their last pane.
@@ -163,24 +181,30 @@ function load(): Agent[] {
     list.push(f[0])
     real.set(f[2], list)
   }
+  // Where each window lives, for panes moved out by the zoom (shown at home).
+  const home = new Map<string, [string, string, string]>()
+  for (const f of rows) if (f[1] !== ZOOM_STASH) home.set(f[2], [f[1], f[3], f[9]])
   const list: Agent[] = []
   for (const f of rows) {
     if (!f[5]) continue
+    const from = f[15] && home.get(f[15])
     const panes = real.get(f[2]) ?? []
     const shown = f[11] === "1"
     list.push({
       pane: f[0],
-      session: f[1],
-      window: f[3],
-      slot: Math.max(0, panes.indexOf(f[0])),
-      windowPanes: Math.max(1, panes.length),
+      session: from ? from[0] : f[1],
+      window: from ? from[1] : f[3],
+      // Numbered from pane-base-index, like tmux, but counting real panes only.
+      slot: (Number(f[16]) || 0) + (from ? 0 : Math.max(0, panes.indexOf(f[0]))),
+      windowPanes: from ? 1 : Math.max(1, panes.length),
       agent: f[5],
       state: (STATES as readonly string[]).includes(f[6]) ? (f[6] as State) : "idle",
       since: Number(f[7]) || 0,
       note: f[8],
-      name: f[9] || basename(f[10]),
+      name: (from ? from[2] : f[9]) || basename(f[10]),
       path: f[10],
       viewing: shown && (sidebarActive.has(f[2]) ? f[13] === "1" : f[12] === "1"),
+      zoomFrom: from ? f[15] : "",
     })
   }
   // Sections in urgency order; blocked: longest waiting first, others: newest.
@@ -205,8 +229,9 @@ let sessions = 1
 // Notification banner: bin/tmux-agents writes @agents_flash_* options; a
 // new @agents_flash_id blinks for FLASH_MS. Read in one display call.
 const FLASH_MS = 3000
-const FLASH_FORMAT = ["id", "state", "agent", "name", "text", "where"].map((k) => `#{@agents_flash_${k}}`).join("\t")
-const readFlashRaw = () => tmux("display", "-p", FLASH_FORMAT).replace(/\n$/, "").split("\t")
+const FLASH_KEYS = ["id", "state", "agent", "name", "text", "where"]
+const FLASH_FORMAT = FLASH_KEYS.map((k) => plain(`@agents_flash_${k}`)).join(SEP)
+const readFlashRaw = () => (records(tmux("display", "-p", FLASH_FORMAT), FLASH_KEYS.length)[0] ?? []).map(clean)
 let flashSeen = readFlashRaw()[0] // ignore notices from before we started
 let flash: { state: State; agent: string; name: string; text: string; where: string; until: number } | undefined
 
@@ -216,15 +241,19 @@ function readFlash() {
   flashSeen = id
   flash = {
     state: (STATES as readonly string[]).includes(state) ? (state as State) : "done",
-    agent,
-    name,
-    text,
+    agent: agent ?? "",
+    name: name ?? "",
+    text: text ?? "",
     where: where ?? "",
     until: Date.now() + FLASH_MS,
   }
 }
 
-const len = (s: string) => [...s].length
+// Display width in cells: wide (CJK, emoji) = 2, combining marks, ZWJ and
+// variation selectors = 0. Cuts happen between graphemes.
+const len: (s: string) => number =
+  typeof Bun.stringWidth === "function" ? (s) => Bun.stringWidth(s) : (s) => [...s].length
+const graphemes = new Intl.Segmenter()
 
 function age(since: number): string {
   if (!since) return ""
@@ -235,10 +264,20 @@ function age(since: number): string {
   return `${Math.floor(s / 86400)}d`
 }
 
+// At most `n` cells, with an ellipsis when cut.
 function cut(s: string, n: number): string {
   if (n <= 0) return ""
-  const chars = [...s]
-  return chars.length <= n ? s : `${chars.slice(0, n - 1).join("")}…`
+  if (len(s) <= n) return s
+  if (len(s.trimEnd()) <= n) return s.trimEnd()
+  let out = ""
+  let w = 0
+  for (const { segment } of graphemes.segment(s)) {
+    const g = len(segment)
+    if (w + g > n - 1) break
+    out += segment
+    w += g
+  }
+  return `${out}…`
 }
 
 function where(a: Agent): string {
@@ -258,12 +297,26 @@ function stateIcon(state: State): string {
   return ICON[state]
 }
 
-// A styled line made of segments, padded/cut to `width`. `base` is a
-// background re-applied after every segment (selection highlight).
+// A styled line made of segments, padded/cut to exactly `width` cells. The
+// right part gets the room the left does not need, and at least half the
+// row; both are cut to fit. `base` is a background re-applied after every
+// segment (selection highlight).
 type Seg = [text: string, style?: string]
 function line(width: number, left: Seg[], right: Seg[] = [], base = ""): string {
+  width = Math.max(0, width)
+  const leftLen = left.reduce((n, [t]) => n + len(t), 0)
   const rightLen = right.reduce((n, [t]) => n + len(t), 0)
-  let room = width - rightLen - (rightLen ? 1 : 0)
+  const rightMax = Math.min(rightLen, Math.max(width - 1 - leftLen, Math.floor(width / 2)))
+  let rightUsed = 0
+  let rightOut = ""
+  for (const [t, style = ""] of right) {
+    if (rightUsed >= rightMax) break
+    const text = cut(t, rightMax - rightUsed)
+    rightUsed += len(text)
+    rightOut += `${style}${text}${RESET}${base}`
+  }
+  const gap = rightUsed && width > rightUsed ? 1 : 0
+  let room = width - rightUsed - gap
   let out = base
   for (const [t, style = ""] of left) {
     if (room <= 0) break
@@ -271,9 +324,8 @@ function line(width: number, left: Seg[], right: Seg[] = [], base = ""): string 
     room -= len(text)
     out += `${style}${text}${RESET}${base}`
   }
-  out += " ".repeat(Math.max(0, room + (rightLen ? 1 : 0)))
-  for (const [t, style = ""] of right) out += `${style}${t}${RESET}${base}`
-  return `${out}${RESET}`
+  out += " ".repeat(Math.max(0, room + gap))
+  return `${out}${rightOut}${RESET}`
 }
 
 function render() {
@@ -357,7 +409,7 @@ function render() {
     const on = focused
       ? i === selected ? bg(C.select) : ""
       : VIEWING === "tint" && a.viewing ? bg(C.viewing) : ""
-    const bar = `${fg(C[a.state])}▎${RESET}`
+    const bar = W > 0 ? `${fg(C[a.state])}▎${RESET}` : ""
     const b = brand(a.agent)
     const inner = W - 1
     const start = lines.length
@@ -389,11 +441,15 @@ function render() {
     entryRows.push({ start, end: lines.length - 1 })
   })
 
-  // Footer: key hints while focused, nothing otherwise.
-  const key = (k: string): Seg => [` ${k} `, `${bg(C.select)}${fg(C.text)}`]
-  const footer = focused
-    ? line(W, [[" "], key("⏎"), [" jump ", fg(C.muted)], key("x"), [" drop ", fg(C.muted)], key("q"), [" hide", fg(C.muted)]])
-    : ""
+  // Footer: key hints while focused, nothing otherwise. Keys are padded
+  // chips when that fits, else single highlighted cells (the default width).
+  const hints = (pad: string): Seg[] => {
+    const key = (k: string): Seg => [`${pad}${k}${pad}`, `${bg(C.select)}${fg(C.text)}`]
+    const label = (t: string): Seg => [t, fg(C.muted)]
+    return [[" "], key("⏎"), label(" jump "), key("x"), label(" drop "), key("q"), label(" hide")]
+  }
+  const wide = hints(" ")
+  const footer = focused ? line(W, wide.reduce((n, [t]) => n + len(t), 0) <= W ? wide : hints("")) : ""
 
   // Credit line on the last row.
   const credit = line(W, [[" by d3vilbug", fg(C.faint)]])
@@ -436,7 +492,11 @@ function refresh() {
   const prev = agents[selected]?.pane
   agents = load()
   readFlash()
-  sessions = new Set(tmux("list-sessions", "-F", "#{session_name}").split("\n").filter(Boolean)).size
+  sessions = new Set(
+    tmux("list-sessions", "-F", plain("session_name"))
+      .split("\n")
+      .filter((n) => n && n !== ZOOM_STASH),
+  ).size
   const keep = agents.findIndex((a) => a.pane === prev)
   selected = keep >= 0 ? keep : Math.max(0, Math.min(selected, agents.length - 1))
   render()
@@ -446,10 +506,16 @@ function refresh() {
 
 function jump(a: Agent | undefined) {
   if (!a) return
+  // A pane moved out by the zoom: unzoom its window first, which brings it back.
+  if (a.zoomFrom) Bun.spawnSync([bin, "zoom", "restore", a.zoomFrom])
   // Window + pane work without a client; switch-client only matters when the
   // agent lives in another session (and fails harmlessly otherwise).
   tmux("select-window", "-t", a.pane, ";", "select-pane", "-t", a.pane)
   tmux("switch-client", "-t", a.pane)
+  // Mark the new pane as the one you look at now, not at the next tick: the
+  // focus-out that follows the jump draws the viewing mark, which would sit
+  // on the card you left for up to a second.
+  refresh()
 }
 
 function forget(a: Agent | undefined) {
@@ -483,7 +549,16 @@ function onKey(k: string, mouse?: RegExpMatchArray) {
     }
     return
   }
-  if (k === "\x1b[I") focused = true
+  if (k === "\x1b[I") {
+    // Coming into the sidebar (a click, prefix + arrow): the cursor starts on
+    // the card you were looking at, where the viewing mark was, instead of
+    // wherever it was left last time (it would flash there before a click).
+    if (!focused) {
+      const here = agents.findIndex((a) => a.viewing)
+      if (here >= 0) selected = here
+    }
+    focused = true
+  }
   else if (k === "\x1b[O") focused = false
   else if (k === "j" || k === "\x1b[B") selected = Math.max(0, Math.min(agents.length - 1, selected + 1))
   else if (k === "k" || k === "\x1b[A") selected = Math.max(0, selected - 1)

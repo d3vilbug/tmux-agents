@@ -28,6 +28,19 @@ $ curl -fsSL https://bun.sh/install | bash
 - tmux 3.8
 
 ### How to Install
+
+#### With TPM
+
+Add the plugin **after** your theme's `@plugin` line (it decorates the theme's tabs), then press `prefix + I`:
+
+```tmux
+set -g @plugin 'd3vilbug/tmux-agents'
+```
+
+TPM loads the tmux part. The first time, a popup shows which agent configs would change (Claude Code, Codex, OpenCode) and asks before connecting them: `y` connects, `n` asks again next time, `x` never asks (it adds `set -g @agents-setup-prompt off` to your `tmux.conf`). Run `~/.tmux/plugins/tmux-agents/install.sh --setup` to connect them later.
+
+#### With the installer
+
 ```bash
 $ git clone https://github.com/d3vilbug/tmux-agents ~/.tmux/plugins/tmux-agents
 $ cd ~/.tmux/plugins/tmux-agents
@@ -45,6 +58,7 @@ config file it changes is backed up to <file>.bak-<timestamp>.
   ./install.sh                 install everything that applies
   ./install.sh --uninstall     undo it
   ./install.sh --dry-run       show what would change (diffs), change nothing
+  ./install.sh --setup         connect the agents only, asking first (the TPM popup)
   options: --no-tmux --no-claude --no-opencode --no-codex
 
 Steps:
@@ -92,10 +106,11 @@ run-shell ~/.tmux/plugins/tmux-agents/tmux-agents.tmux
 ```
 
 ### Tmux Agents Features
-- **Agents sidebar** (`prefix + a`): every pane running an agent, grouped by state. It follows you across windows and sessions. Enter or a click jumps to the pane.
+- **Agents sidebar** (`prefix + a`): every pane running an agent, grouped by state. It follows you across windows and sessions. Click an agent (or select it and press Enter) to go straight to its pane: tmux switches to its window, and its session if needed.
 - **Tab state icons**: each window tab shows the most urgent state of its agents. Working tabs animate like the agent's own spinner.
 - **Toasts**: a short floating notice in the top-right corner when an agent you are not looking at needs input (or finishes, if you want).
 - **Unseen tracking**: *done* turns into *idle* once you have looked at the pane.
+- **Zoom that keeps the sidebar** (opt-in): `prefix + z` zooms a pane while the sidebar stays visible. See [Zoom with the Sidebar](#zoom-with-the-sidebar).
 - **No daemon, no state files**: all state lives in tmux pane and window options.
 - **Any agent**: other tools can report their state with one command.
 
@@ -109,15 +124,30 @@ run-shell ~/.tmux/plugins/tmux-agents/tmux-agents.tmux
 ### Keybindings
 ```
 prefix + a          toggle the sidebar
+prefix + z          zoom the pane (keeps the sidebar with @agents-zoom-keeps-sidebar on)
 
 In the sidebar:
   j / k, arrows     move the selection (mouse wheel works too)
-  Enter, click      jump to the agent's pane
+  Enter, click      go to the agent's pane (switches window and session)
   x                 forget the selected entry
   q                 close the sidebar
 ```
 
 ![Sidebar Toggle](assets/tmux-agents-sidebar.gif)
+
+### Zoom with the Sidebar
+
+tmux zoom (`prefix + z`) hides every other pane, the sidebar too. To keep the sidebar visible while you zoom, add this to `~/.tmux.conf` above the tmux-agents `run-shell` line (with TPM: above the TPM `run` line), then `tmux source ~/.tmux.conf`:
+
+```tmux
+set -g @agents-zoom-keeps-sidebar on
+```
+
+- In a window with the sidebar open, `prefix + z` makes your pane fill everything but the sidebar. Press it again to bring the other panes back in the exact same layout.
+- The other panes keep running in the meantime (in a hidden tmux session, `_agents_zoom`), and their agents still show in the sidebar at their own window. Jumping to one from the sidebar unzooms first.
+- The tab of a zoomed window shows a `Z` marker (`@agents-tab-icon-zoom`).
+- In a window without the sidebar, `prefix + z` is the normal tmux zoom.
+- Nothing is lost: closing the zoomed pane brings the other panes back, and closing the whole window moves them, as one window, into their own session (or into a new visible session `agents-rescued` when no other session is left). To turn the option off, set `set -g @agents-zoom-keeps-sidebar off` (removing the line is not enough until tmux restarts) and `tmux source ~/.tmux.conf`: that undoes every zoom and gives `prefix + z` back to tmux. Uninstalling does the same.
 
 ### Command Cheatsheet
 
@@ -132,7 +162,7 @@ $ ./install.sh --no-opencode
 $ ./install.sh --no-claude --no-codex --no-opencode      # tmux only
 
 # Update
-$ cd ~/.tmux/plugins/tmux-agents && git pull && tmux source ~/.tmux.conf
+$ cd ~/.tmux/plugins/tmux-agents && git pull && ./install.sh   # add the same --no-... options you installed with
 
 # Report the state of any other agent or script (run inside a tmux pane)
 $ TA=~/.tmux/plugins/tmux-agents/bin/tmux-agents
@@ -142,7 +172,7 @@ $ $TA report done myagent
 $ $TA clear
 ```
 
-After an update, press `prefix + a` twice to restart an open sidebar on the new code. Running Claude Code and Codex sessions keep their old hooks until restarted, and OpenCode needs the full restart again after a plugin change.
+After an update, `./install.sh` reloads the plugin and restarts open sidebars on the new code, and adds the hooks of any agent support that is new. It does not remember earlier `--no-claude`, `--no-codex` or `--no-opencode` choices: pass them again, or run only `tmux source ~/.tmux.conf` to reload tmux. TPM users update with `prefix + U`. Running Claude Code and Codex sessions keep their old hooks until restarted, and OpenCode needs the full restart again after a plugin change.
 
 ### Uninstall
 ```bash
@@ -154,6 +184,8 @@ $ rm -rf ~/.tmux/plugins/tmux-agents
 
 This removes the `run-shell` line, the tmux key and hooks, the open sidebar and its state, the Claude Code and Codex hooks and the OpenCode plugin (each file is backed up first). `[features] hooks = true` stays in `~/.codex/config.toml`, since your own hooks may need it. Restart running agent sessions before deleting the folder, and do the full OpenCode restart.
 
+With TPM: first delete the `@plugin` line from `~/.tmux.conf`, then run `~/.tmux/plugins/tmux-agents/install.sh --uninstall` (it removes the hooks and the tmux state), then press `prefix + alt + u` so TPM deletes the folder. If you uninstall while the `@plugin` line is still there, the installer cleans up without re-sourcing `tmux.conf` (that would load the plugin again) and reminds you to remove the line.
+
 ### Configuration
 
 Set options in `~/.tmux.conf` **above** the `run-shell` line, then `tmux source ~/.tmux.conf`. All options and their defaults are in [`defaults.conf`](defaults.conf).
@@ -162,9 +194,11 @@ Set options in `~/.tmux.conf` **above** the `run-shell` line, then `tmux source 
 set -g @agents-key a                    # prefix + <key> toggles the sidebar
 set -g @agents-sidebar-width 22         # a width you drag the sidebar to is remembered
 set -g @agents-notify toast             # toast | off
-set -g @agents-notify-on "blocked"      # states that notify: any of "blocked done"
+set -g @agents-notify-on "blocked"      # states that notify: any of "blocked done", or "off" for none
 set -g @agents-toast-seconds 2.5
 set -g @agents-show-viewing tint        # mark the pane you look at: tint | eye | off
+set -g @agents-zoom-keeps-sidebar off   # on: prefix + z zooms a pane but keeps the sidebar visible
+set -g @agents-setup-prompt on          # off: no "connect your agents" popup (TPM installs)
 
 # Colors and icons per state (blocked, done, working, idle)
 set -g @agents-color-blocked "#cc6666"
@@ -183,6 +217,7 @@ run-shell ~/.tmux/plugins/tmux-agents/tmux-agents.tmux
 | An OpenCode pane is missing | Check the absolute path in `cli.json`, then do the full restart. `/plugins` in the TUI lists it. |
 | No toast | You were looking at that pane, or the state is not in `@agents-notify-on`, or `@agents-notify` is `off`. |
 | Card stuck at *working* after Esc | Claude Code has no hook for Esc. It turns idle after 60 s of waiting for input, or on the next prompt. |
+| `prefix + z` hides the sidebar | That is tmux zoom: it hides every other pane. Set `@agents-zoom-keeps-sidebar on` to zoom a pane while the sidebar stays visible (the other panes come back when you press `prefix + z` again). |
 | Every event shows up twice | Two copies are configured. `./install.sh --dry-run` lists the entries of the other copy. |
 
 ### How It Works

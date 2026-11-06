@@ -37,11 +37,15 @@ update_window() {
   best=""
   best_agent=""
   best_rank=0
-  for sa in $(tmux list-panes -t "$1" -F '#{@agent_state}:#{@agent}' 2>/dev/null); do
+  # One line per pane (an agent name may hold spaces); here-doc, not a pipe,
+  # so the loop sets the variables in this shell.
+  while IFS= read -r sa; do
     s=${sa%%:*}
     r=$(rank "$s")
     if [ "$r" -gt "$best_rank" ]; then best=$s; best_agent=${sa#*:}; best_rank=$r; fi
-  done
+  done <<EOF
+$(tmux list-panes -t "$1" -F '#{@agent_state}:#{@agent}' 2>/dev/null)
+EOF
   if [ -n "$best" ]; then
     tmux set -w -t "$1" @agent_win_state "$best" \; set -w -t "$1" @agent_win_agent "$best_agent"
   else
@@ -49,22 +53,46 @@ update_window() {
   fi
 }
 
+# awk helpers for commands fed to `tmux source-file`: fields(n) splits $0 at
+# single spaces into f[1..n], the last one the rest of the line (an agent name
+# may hold spaces, an empty field stays a field); q(s) is s in double quotes
+# with tmux's specials escaped, so a name can never end the string and run
+# its own commands.
+AWK_LIB='
+  function fields(n,   line, i, k) {
+    line = $0
+    for (k = 1; k < n && (i = index(line, " ")) > 0; k++) { f[k] = substr(line, 1, i - 1); line = substr(line, i + 1) }
+    f[k] = line
+    for (k++; k <= n; k++) f[k] = ""
+  }
+  function q(s,   out, c, i) {
+    out = ""
+    for (i = 1; i <= length(s); i++) {
+      c = substr(s, i, 1)
+      if (c == "\\" || c == "\"" || c == "$") out = out "\\"
+      out = out c
+    }
+    return "\"" out "\""
+  }'
+
 # Recompute @agent_win_state for every window in one pass; works when the
 # pane that changed is already gone. Only changed windows are written.
 update_all_windows() {
   {
     tmux list-windows -a -F 'W #{window_id} #{@agent_win_state} #{@agent_win_agent}' 2>/dev/null
-    tmux list-panes -a -f '#{@agent_state}' -F 'P #{window_id} #{@agent_state} #{@agent}' 2>/dev/null
-  } | awk '
+    # A pane moved out by the zoom counts for its home window.
+    tmux list-panes -a -f '#{@agent_state}' -F 'P #{?#{@agents_zoom_from},#{@agents_zoom_from},#{window_id}} #{@agent_state} #{@agent}' 2>/dev/null
+  } | awk "$AWK_LIB"'
     function rank(s) { return s == "blocked" ? 4 : s == "done" ? 3 : s == "working" ? 2 : s == "idle" ? 1 : 0 }
-    $1 == "W" { cur[$2] = $3; cura[$2] = $4; order[++n] = $2 }
-    $1 == "P" && rank($3) > rank(best[$2]) { best[$2] = $3; agent[$2] = $4 }
+    { fields(4) }
+    f[1] == "W" { cur[f[2]] = f[3]; cura[f[2]] = f[4]; order[++n] = f[2] }
+    f[1] == "P" && rank(f[3]) > rank(best[f[2]]) { best[f[2]] = f[3]; agent[f[2]] = f[4] }
     END {
       for (i = 1; i <= n; i++) {
         w = order[i]
         if (best[w] == cur[w] && agent[w] == cura[w]) continue
         if (best[w] == "") print "set -wu -t " w " @agent_win_state ; set -wu -t " w " @agent_win_agent"
-        else print "set -w -t " w " @agent_win_state " best[w] " ; set -w -t " w " @agent_win_agent \"" agent[w] "\""
+        else print "set -w -t " w " @agent_win_state " best[w] " ; set -w -t " w " @agent_win_agent " q(agent[w])
       }
     }' | tmux source-file - 2>/dev/null
 }
@@ -72,24 +100,49 @@ update_all_windows() {
 # The sidebar draws its own right-edge line, so windows holding it get tmux's
 # active-pane border hidden (same style as the inactive one): with two panes
 # tmux colors half the shared border, which looks like a scrollbar beside
-# ours. Reverted when the sidebar leaves the window. Only changes are written.
+# ours. A border style you set on that window yourself is kept in
+# @agents_border_saved and comes back when the sidebar leaves; the style set
+# is kept in @agents_border_hidden ("1" from older versions), so a style you
+# set meanwhile is left alone. The hook in tmux-agents.tmux does the same
+# before the redraw; here only changes are written.
 sync_borders() {
-  cmds=$({
-    tmux list-windows -a -F 'W #{window_id} #{@agents_border_hidden}' 2>/dev/null
+  g=$(tmux show -gwv pane-active-border-style)
+  [ "$(tmux show -gqv @agents_border_global)" = "$g" ] || tmux set -g @agents_border_global "$g"
+  {
+    tmux list-windows -a -F 'W #{window_id} #{?@agents_border_hidden,1,}#{?@agents_border_saved,s,}' 2>/dev/null
     tmux list-panes -a -f '#{@agents_sidebar}' -F 'S #{window_id}' 2>/dev/null
-  } | awk -v style="$(tmux show -gwv pane-border-style)" '
-    $1 == "W" { hidden[$2] = $3; order[++n] = $2 }
+  } | awk '
+    $1 == "W" { st[$2] = $3; order[++n] = $2 }
     $1 == "S" { sb[$2] = 1 }
     END {
       for (i = 1; i <= n; i++) {
         w = order[i]
-        if (sb[w] && hidden[w] != "1")
-          print "set -w -t " w " pane-active-border-style \"" style "\" ; set -w -t " w " @agents_border_hidden 1"
-        else if (!sb[w] && hidden[w] == "1")
-          print "set -wu -t " w " pane-active-border-style ; set -wu -t " w " @agents_border_hidden"
+        if (sb[w] && st[w] !~ /1/) print "hide", w
+        else if (sb[w] && st[w] == "1s") print "check", w
+        else if (!sb[w] && st[w] ~ /[1s]/) print "restore", w
       }
-    }')
-  [ -n "$cmds" ] && printf '%s\n' "$cmds" | tmux source-file - 2>/dev/null
+    }' | while read -r act w; do
+    case "$act" in
+      hide)
+        style=$(tmux show -gwv pane-border-style)
+        mine=$(tmux show -wqv -t "$w" pane-active-border-style)
+        if [ -n "$mine" ]; then tmux set -w -t "$w" @agents_border_saved "$mine"; else tmux set -wu -t "$w" @agents_border_saved; fi
+        tmux set -w -t "$w" pane-active-border-style "$style" \; set -w -t "$w" @agents_border_hidden "$style" ;;
+      check)
+        # Saved by the hook, which cannot tell a style of yours from the
+        # global one: equal to the global one means it was not yours.
+        [ "$(tmux show -wqv -t "$w" @agents_border_saved)" = "$g" ] && tmux set -wu -t "$w" @agents_border_saved ;;
+      restore)
+        set_by_us=$(tmux show -wqv -t "$w" @agents_border_hidden)
+        saved=$(tmux show -wqv -t "$w" @agents_border_saved)
+        now=$(tmux show -wqv -t "$w" pane-active-border-style)
+        if [ "$set_by_us" = 1 ] || { [ -n "$set_by_us" ] && [ "$now" = "$set_by_us" ]; }; then
+          if [ -n "$saved" ]; then tmux set -w -t "$w" pane-active-border-style "$saved"
+          else tmux set -wu -t "$w" pane-active-border-style; fi
+        fi
+        tmux set -wu -t "$w" @agents_border_hidden \; set -wu -t "$w" @agents_border_saved ;;
+    esac
+  done 2>/dev/null
   return 0
 }
 
@@ -139,7 +192,268 @@ agent_icon() {
   case "$1" in claude | opencode | codex) opt "@agents-icon-$1" ;; *) opt @agents-icon-agent ;; esac
 }
 
+# --- sidebar-aware zoom (opt-in: @agents-zoom-keeps-sidebar on) ----------------
+# tmux zoom hides every other pane, the sidebar too. This zoom instead moves the
+# window's other panes into one window of a hidden session ($ZOOM_STASH), so the
+# pane fills everything but the sidebar; zooming again moves them back in their
+# old order and re-applies the saved layout. Window options on the zoomed window:
+#   @agents_zoom         its real panes (no sidebar), in index order
+#   @agents_zoom_layout  #{window_layout} before zooming (toasts closed first)
+# Each moved pane carries @agents_zoom_from (zoomed window id) and
+# @agents_zoom_session (its session id). Operations hold a lock, so a double
+# prefix + z (or a sweep during a zoom) cannot interleave.
+ZOOM_STASH=_agents_zoom
+
+zoom_lock() {
+  ZLOCK="$(tmux display -p '#{socket_path}' 2>/dev/null).agents-zoom.lock"
+  i=0
+  while ! mkdir "$ZLOCK" 2>/dev/null; do
+    i=$((i + 1))
+    # A holder that died leaves the lock: take it over after about 5 s.
+    if [ "$i" -ge 50 ]; then rm -rf "$ZLOCK"; mkdir "$ZLOCK" 2>/dev/null; break; fi
+    sleep 0.1
+  done
+  trap 'rmdir "$ZLOCK" 2>/dev/null' EXIT INT TERM
+}
+
+# Real panes of window $1 (no sidebar, no floating), in index order.
+real_panes() {
+  tmux list-panes -t "$1" -f '#{&&:#{!=:#{@agents_sidebar},1},#{!=:#{pane_floating_flag},1}}' -F '#{pane_id}' 2>/dev/null
+}
+
+# Toasts are floating panes and part of #{window_layout}: close them so a
+# saved layout and the window it is applied to have the same panes.
+close_toasts() {
+  for t in $(tmux list-panes -t "$1" -f '#{@agents_toast}' -F '#{pane_id}' 2>/dev/null); do tmux kill-pane -t "$t"; done
+}
+
+# Pane ids in a saved layout / in a window, sorted, one line.
+layout_ids() { printf '%s' "$1" | grep -o '"I":"%[0-9]*"' | sed 's/.*"\(%[0-9]*\)"/\1/' | sort | tr '\n' ' '; }
+window_ids() { tmux list-panes -t "$1" -F '#{pane_id}' 2>/dev/null | sort | tr '\n' ' '; }
+
+zoom_forget_moved() { tmux set -pu -t "$1" @agents_zoom_from \; set -pu -t "$1" @agents_zoom_session 2>/dev/null; }
+
+zoom_restore() { # <window>
+  win=$1
+  list=$(tmux show -wqv -t "$win" @agents_zoom 2>/dev/null)
+  [ -n "$list" ] || return 0
+  layout=$(tmux show -wqv -t "$win" @agents_zoom_layout)
+  close_toasts "$win"
+  # Pane -> window, from one list: "display -t" falls back to another pane
+  # for one that is gone instead of failing.
+  where=$(tmux list-panes -a -F '#{pane_id} #{window_id}')
+  prev=""
+  for p in $list; do
+    pw=$(printf '%s\n' "$where" | awk -v p="$p" '$1 == p { print $2 }')
+    [ -n "$pw" ] || continue # pane is gone
+    if [ "$pw" != "$win" ]; then
+      if [ -n "$prev" ]; then
+        tmux join-pane -d -h -s "$p" -t "$prev"
+      else
+        first=$(real_panes "$win" | head -n 1)
+        if [ -n "$first" ]; then tmux join-pane -d -h -b -s "$p" -t "$first"
+        else tmux join-pane -d -h -s "$p" -t "$(tmux list-panes -t "$win" -F '#{pane_id}' | tail -n 1)"; fi
+      fi
+      zoom_forget_moved "$p"
+    fi
+    prev=$p
+  done
+  # The exact old layout only when the window has exactly its panes again;
+  # else (a pane closed while zoomed) just give the sidebar its width back.
+  # (tmux 3.8 layouts are JSON with pane ids; older ones have no floating
+  # panes, so select-layout alone is enough there.)
+  w=$(tmux show -gqv @agents_sidebar_width_saved); [ -n "$w" ] || w=$(opt @agents-sidebar-width)
+  same="" lent="" lent_sb=""
+  case "$layout" in
+    *'"I":'*)
+      ids=$(layout_ids "$layout")
+      if [ "$ids" = "$(window_ids "$win")" ]; then same=1
+      else
+        # The sidebar follows you, so a window unzoomed from elsewhere (the
+        # sidebar's jump to a moved pane) misses only it: borrow it for the
+        # exact layout, unless that would close the window it is in.
+        lend=$(tmux list-panes -s -t "$win" -f '#{@agents_sidebar}' -F '#{pane_id} #{window_id}' 2>/dev/null | head -n 1)
+        lent_sb=${lend%% *}; lent=${lend#* }
+        if [ -n "$lend" ] && [ "$lent" != "$win" ] && [ -n "$(real_panes "$lent")" ] &&
+          [ "$ids" = "$({ tmux list-panes -t "$win" -F '#{pane_id}'; echo "$lent_sb"; } | sort | tr '\n' ' ')" ] &&
+          tmux join-pane -hbf -d -l "$w" -s "$lent_sb" -t "$(real_panes "$win" | head -n 1)" 2>/dev/null; then
+          same=1
+        else lent=""; fi
+      fi ;;
+    *) same=1 ;;
+  esac
+  if [ "$same" = 1 ] && tmux select-layout -t "$win" "$layout" 2>/dev/null; then :; else
+    sb=$(tmux list-panes -t "$win" -f '#{@agents_sidebar}' -F '#{pane_id}' | head -n 1)
+    [ -n "$sb" ] && tmux resize-pane -t "$sb" -x "$w"
+  fi
+  if [ -n "$lent" ]; then
+    # Back where it was, except for the sidebar's own jump (the call comes
+    # from inside it): it selects this window next, where the sidebar is now.
+    if [ "${TMUX_PANE:-}" != "$lent_sb" ]; then
+      tmux join-pane -hbf -d -l "$w" -s "$lent_sb" -t "$(real_panes "$lent" | head -n 1)" 2>/dev/null
+    fi
+    sync_borders
+  fi
+  tmux set -wu -t "$win" @agents_zoom \; set -wu -t "$win" @agents_zoom_layout
+  update_all_windows
+}
+
+zoom_toggle() { # <window> <pane>
+  win=$1 pane=$2
+  sb=$(tmux list-panes -t "$win" -f '#{@agents_sidebar}' -F '#{pane_id}' 2>/dev/null | head -n 1)
+  if [ -n "$(tmux show -wqv -t "$win" @agents_zoom)" ]; then
+    zoom_restore "$win"; tmux select-pane -t "$pane" 2>/dev/null; return 0
+  fi
+  # No sidebar here, the sidebar itself, or a plain tmux zoom already on: tmux zoom.
+  if [ -z "$sb" ] || [ "$pane" = "$sb" ] || [ "$(tmux display -p -t "$win" '#{window_zoomed_flag}')" = 1 ]; then
+    tmux resize-pane -Z -t "$pane"; return 0
+  fi
+  close_toasts "$win"
+  others=$(real_panes "$win" | grep -vx "$pane")
+  if [ -z "$others" ]; then
+    tmux display-message "tmux-agents: nothing to zoom, this is the only pane next to the sidebar"; return 0
+  fi
+  list=$(real_panes "$win" | tr '\n' ' ')
+  layout=$(tmux display -p -t "$win" '#{window_layout}')
+  sess=$(tmux display -p -t "$win" '#{session_id}')
+  fresh=""
+  if ! tmux has-session -t "=$ZOOM_STASH" 2>/dev/null; then
+    # Kept alive even with destroy-unattached on, which would kill it at once.
+    fresh=$(tmux new-session -d -P -F '#{window_id}' -s "$ZOOM_STASH" "exec sleep 2147483647" \
+      \; set -t "=$ZOOM_STASH:" destroy-unattached off)
+  fi
+  stash=""
+  for p in $others; do
+    tmux set -p -t "$p" @agents_zoom_from "$win" \; set -p -t "$p" @agents_zoom_session "$sess"
+    if [ -z "$stash" ]; then
+      stash=$(tmux break-pane -d -P -F '#{window_id}' -s "$p" -t "=$ZOOM_STASH:" 2>/dev/null)
+      if [ -z "$stash" ]; then
+        for q in $others; do zoom_forget_moved "$q"; done
+        tmux display-message "tmux-agents: zoom failed, nothing was moved"; return 0
+      fi
+    else
+      tmux join-pane -d -s "$p" -t "$stash"
+    fi
+  done
+  # Only now, with the panes moved, is the window zoomed.
+  tmux set -w -t "$win" @agents_zoom "$list" \; set -w -t "$win" @agents_zoom_layout "$layout"
+  [ -n "$fresh" ] && tmux kill-window -t "$fresh"
+  tmux select-pane -t "$pane"
+  update_all_windows
+}
+
+# From sweep: put moved panes back when the normal unzoom cannot: the zoomed
+# pane is gone, the window is gone, or a pane is out without zoom state. Then
+# drop zoom state nothing can restore any more: a pane carrying it outside
+# the hidden session, a zoomed window whose moved panes are all gone.
+zoom_rescue() {
+  sessions=$(tmux list-sessions -F '#{session_id} #{session_name}' 2>/dev/null)
+  # By id: the hidden session may be renamed below, mid-loop.
+  zsid=$(printf '%s\n' "$sessions" | awk -v s="$ZOOM_STASH" '$2 == s { print $1; exit }')
+  wins=$(tmux list-windows -a -F '#{window_id} #{?@agents_zoom,Z,-}' 2>/dev/null)
+  renamed=""
+  for zw in $([ -n "$zsid" ] && tmux list-panes -s -t "$zsid" -f '#{@agents_zoom_from}' -F '#{@agents_zoom_from}' 2>/dev/null | sort -u); do
+    moved=$(tmux list-panes -s -t "$zsid" -f "#{==:#{@agents_zoom_from},$zw}" -F '#{pane_id}')
+    zflag=$(printf '%s\n' "$wins" | awk -v w="$zw" '$1 == w { print $2; exit }')
+    if [ "$zflag" = Z ]; then
+      # Zoomed window alive: unzoom once only the sidebar is left in it.
+      [ -z "$(real_panes "$zw")" ] && zoom_restore "$zw"
+    elif [ -n "$zflag" ]; then
+      # Alive but not zoomed (an interrupted zoom): join the panes back.
+      for p in $moved; do
+        tmux join-pane -d -h -s "$p" -t "$(real_panes "$zw" | tail -n 1)" 2>/dev/null ||
+          tmux join-pane -d -h -s "$p" -t "$(tmux list-panes -t "$zw" -F '#{pane_id}' | tail -n 1)"
+        zoom_forget_moved "$p"
+      done
+    else
+      # Window gone: their hidden window goes to the panes' own session, else
+      # another one; with none left, the hidden session becomes a visible one
+      # (once: later hidden windows are then in it already).
+      first=$(printf '%s\n' "$moved" | head -n 1)
+      hw=$(tmux display -p -t "$first" '#{window_id}')
+      home=$(tmux show -pqv -t "$first" @agents_zoom_session)
+      target=$(printf '%s\n' "$sessions" | awk -v h="$home" -v s="$ZOOM_STASH" '$1 == h && $2 != s { print $1; exit }')
+      [ -n "$target" ] || target=$(printf '%s\n' "$sessions" | awk -v s="$ZOOM_STASH" '$2 != s { print $1; exit }')
+      for p in $moved; do zoom_forget_moved "$p"; done
+      if [ -n "$target" ]; then
+        tmux move-window -d -s "$hw" -t "$target:" \; select-layout -t "$hw" even-horizontal
+      else
+        [ -n "$renamed" ] || { tmux rename-session -t "$zsid" agents-rescued; renamed=1; }
+        tmux select-layout -t "$hw" even-horizontal
+      fi
+    fi
+  done
+  # Leftover zoom state. A pane in the hidden session keeps it (its window
+  # is still zoomed); anywhere else it points to a window that is gone or
+  # no longer zoomed, and would count for that window's tab.
+  zfrom=" "
+  while read -r p from sname; do
+    [ -n "$p" ] || continue
+    if [ "$sname" = "$ZOOM_STASH" ]; then zfrom="$zfrom$from "; else zoom_forget_moved "$p"; fi
+  done <<EOF
+$(tmux list-panes -a -f '#{@agents_zoom_from}' -F '#{pane_id} #{@agents_zoom_from} #{session_name}' 2>/dev/null)
+EOF
+  for zw in $(tmux list-windows -a -f '#{@agents_zoom}' -F '#{window_id}' 2>/dev/null); do
+    case "$zfrom" in *" $zw "*) ;; *) zoom_restore "$zw" ;; esac
+  done
+}
+
+# Uninstall / turning the option off: undo every sidebar-aware zoom.
+zoom_restore_all() {
+  for win in $(tmux list-windows -a -f '#{@agents_zoom}' -F '#{window_id}' 2>/dev/null); do zoom_restore "$win"; done
+  zoom_rescue
+  update_all_windows
+  return 0
+}
+
+cmd_zoom() {
+  case "${1:-}" in
+    toggle) w=${2:-$(tmux display -p '#{window_id}')}; p=${3:-$(tmux display -p '#{pane_id}')}; zoom_lock; zoom_toggle "$w" "$p" ;;
+    restore) w=${2:-$(tmux display -p '#{window_id}')}; zoom_lock; zoom_restore "$w" ;;
+    restore-all) zoom_lock; zoom_restore_all ;;
+  esac
+}
+
+# --- first-run setup popup (TPM installs) --------------------------------------
+# TPM only loads the tmux part. Once per tmux run, when a client is there, ask
+# (in a popup running install.sh --setup) whether to connect the installed
+# agents, but only when something is missing, the user did not opt out
+# (@agents-setup-prompt off), and the plugin is not set up by install.sh (its
+# run-shell line in tmux.conf: that user already chose what to install).
+cmd_setup_prompt() { # [client]
+  [ "$(opt @agents-setup-prompt)" = off ] && return 0
+  [ "$(tmux show -gqv @agents_setup_prompted)" = 1 ] && return 0
+  for conf in "$HOME/.tmux.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf" "$HOME/.config/tmux/tmux.conf"; do
+    [ -f "$conf" ] || continue
+    grep -v '^[[:space:]]*#' "$conf" | grep -qF -e "$ROOT/tmux-agents.tmux" -e "~${ROOT#"$HOME"}/tmux-agents.tmux" && return 0
+  done
+  client=${1:-$(tmux list-clients -F '#{client_name}' 2>/dev/null | head -n 1)}
+  [ -n "$client" ] || return 0 # no client yet: client-attached calls again
+  tmux set -g @agents_setup_prompted 1
+  sh "$ROOT/install.sh" --check-setup || return 0
+  q=$(printf '%s' "$ROOT/install.sh" | sed "s/'/'\\\\''/g")
+  tmux display-popup -c "$client" -E -w 90% -h 85% -T " tmux-agents " "sh '$q' --setup" 2>/dev/null
+  return 0
+}
+
 # --- notifications -----------------------------------------------------------
+
+# sq <s>: s in single quotes for sh (the toast pane runs its command via sh -c).
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# Short lock around the toast slot scan: a hook never waits more than ~2 s
+# (a holder that died leaves the lock, it is taken over then).
+toast_lock() {
+  TLOCK="$(tmux display -p '#{socket_path}' 2>/dev/null).agents-toast.lock"
+  i=0
+  while ! mkdir "$TLOCK" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -ge 20 ]; then rm -rf "$TLOCK"; mkdir "$TLOCK" 2>/dev/null; break; fi
+    sleep 0.1
+  done
+  trap 'rmdir "$TLOCK" 2>/dev/null' EXIT INT TERM
+}
+toast_unlock() { rmdir "$TLOCK" 2>/dev/null; trap - EXIT INT TERM; }
 
 # toast <state> <agent> <name> <text> <where>
 # Toast: a small floating pane in the top-right corner of the window you are
@@ -167,6 +481,11 @@ cmd_toast() {
   client=$(echo "$line" | cut -d' ' -f4-)
   w=$(opt @agents-toast-width)
   [ "$w" -gt $((ww - 4)) ] && w=$((ww - 4))
+  col=$(state_color "$state")
+  body="exec $(sq "$ROOT/bin/tmux-agents") toast-body $(sq "$state") $(sq "$agent") $(sq "$name") $(sq "$text") $(sq "$where")"
+  # Hooks firing at the same moment would all find the same slot free: pick
+  # the slot and create (and mark) the toast under a lock.
+  toast_lock
   # First free 4-row slot from the top (toasts close in any order).
   tops=$(tmux list-panes -t "$win" -f '#{@agents_toast}' -F '#{pane_top}' 2>/dev/null | tr '\n' ' ')
   slot=0
@@ -178,15 +497,12 @@ cmd_toast() {
     [ "$taken" = 0 ] && break
     slot=$((slot + 1))
   done
-  col=$(state_color "$state")
   id=$(tmux new-pane -d -A -P -F '#{pane_id}' -t "$win" \
     -x "$w" -y 4 -X $((ww - w - 1)) -Y $((slot * 4)) -B "$(opt @agents-toast-border)" \
-    -s "bg=$(opt @agents-color-bg)" -S "fg=$col" -R "fg=$col" \
-    "exec '$ROOT/bin/tmux-agents' toast-body '$state' '$agent' '$(printf '%s' "$name" | tr -d "'")' '$(printf '%s' "$text" | tr -d "'")' '$where'" \
-    2>/dev/null)
-  if [ -n "$id" ]; then
-    tmux set -p -t "$id" @agents_toast 1
-  else # tmux without floating panes
+    -s "bg=$(opt @agents-color-bg)" -S "fg=$col" -R "fg=$col" "$body" 2>/dev/null)
+  [ -n "$id" ] && tmux set -p -t "$id" @agents_toast 1
+  toast_unlock
+  if [ -z "$id" ]; then # tmux without floating panes
     # Doubled "#" so a window or folder name is shown, not expanded.
     tmux display-message -c "$client" -d 2500 "$(printf '%s' "$name: $text ($where)" | sed 's/#/##/g')"
   fi
@@ -200,7 +516,9 @@ cmd_toast_body() {
     blocked | done) icon=$(opt "@agents-icon-$state") ;;
     *) icon=$(opt @agents-icon-idle) ;;
   esac
-  printf '\033[?25l'
+  # No cursor, and no line wrap: a long name or window name is cut at the
+  # right edge instead of wrapping, which would scroll the first row out.
+  printf '\033[?25l\033[?7l'
   printf ' %s%s \033[1m%s%s\033[0m\n' "$(fg "$col")" "$(agent_icon "$agent")" "$(fg "$(opt @agents-color-text)")" "$name"
   printf ' %s%s %s\033[0m  %s%s %s\033[0m' "$(fg "$col")" "$icon" "$text" \
     "$(fg "$(opt @agents-color-muted)")" "$(opt @agents-icon-window)" "$where"
@@ -216,18 +534,35 @@ cmd_report() {
   note=${3:-}
   pane=${TMUX_AGENTS_PANE:-${TMUX_PANE:-}}
   [ -n "$pane" ] && [ -n "$state" ] || exit 0
+  # The sidebar splits its rows on newlines and tabs, and prints the text to
+  # a terminal: control characters become spaces (no fork in the usual case).
+  case "$agent$note" in
+    *[[:cntrl:]]*)
+      agent=$(printf '%s' "$agent" | tr '[:cntrl:]' ' ')
+      note=$(printf '%s' "$note" | tr '[:cntrl:]' ' ') ;;
+  esac
 
-  # One round trip for everything we need to decide.
+  # One round trip for everything we need to decide. For a pane that is gone
+  # tmux still prints the format (all empty) and exits 0: no #{pane_id}.
   info=$(tmux display -p -t "$pane" \
-    '#{@agent_state}|#{@agent}|#{@agent_note}|#{session_id}|#{window_index}|#{?#{automatic-rename},#{b:pane_current_path},#{window_name}}' \
+    '#{pane_id}|#{@agent_state}|#{@agent}|#{@agent_note}|#{@agents_zoom_from}|#{session_id}|#{window_index}|#{?#{automatic-rename},#{b:pane_current_path},#{window_name}}' \
     2>/dev/null) || exit 0
+  case "$info" in "|"* | "") exit 0 ;; esac
+  info=${info#*|}
   prev=${info%%|*}; rest=${info#*|}
   prev_agent=${rest%%|*}; rest=${rest#*|}
   prev_note=${rest%%|*}; rest=${rest#*|}
+  zoomed_from=${rest%%|*}; rest=${rest#*|}
   sess=${rest%%|*}; rest=${rest#*|}
   where=${rest%%|*}
   name=${rest#*|} # last: may contain "|"
   [ -n "$agent" ] || agent=${prev_agent:-agent}
+  # Moved out by the zoom: report where the pane lives, its home window.
+  if [ -n "$zoomed_from" ]; then
+    home=$(tmux display -p -t "$zoomed_from" '#{session_id}|#{window_index}|#{?#{automatic-rename},,#{window_name}}' 2>/dev/null) && {
+      sess=${home%%|*}; home=${home#*|}; where=${home%%|*}; hn=${home#*|}; [ -n "$hn" ] && name=$hn
+    }
+  fi
 
   # A finished turn you are looking at, in a focused terminal showing this
   # session, is already seen.
@@ -250,10 +585,11 @@ cmd_report() {
   else
     tmux set -p -t "$pane" @agent "$agent" \; set -p -t "$pane" @agent_state "$state" \
       \; set -p -t "$pane" @agent_since "$(date +%s)" \; set -p -t "$pane" @agent_note "$note"
-    update_window "$pane"
+    if [ -n "$zoomed_from" ]; then update_all_windows; else update_window "$pane"; fi
   fi
   poke_sidebar
 
+  # States that notify, e.g. "blocked done"; "off" names no state, so none.
   notify_on=" $(opt @agents-notify-on) "
   if [ "$state" != "$prev" ] && [ "$focused" = 0 ] && [ "${notify_on#* "$state" }" != "$notify_on" ]; then
     case "$state" in
@@ -314,8 +650,14 @@ cmd_sweep() {
   done <<EOF
 $(tmux list-panes -a -f '#{@agent}' -F '#{pane_id} #{pane_current_command} #{@agent_shell_since}' 2>/dev/null)
 EOF
+  # Zoom work: moved panes, a zoomed window (window options show in pane formats).
+  if [ -n "$(tmux list-panes -a -f '#{||:#{@agents_zoom_from},#{@agents_zoom}}' -F x 2>/dev/null)" ]; then
+    zoom_lock; zoom_rescue
+  fi
   update_all_windows
-  for p in $(tmux list-panes -a -f '#{&&:#{@agents_sidebar},#{==:#{window_panes},1}}' -F '#{pane_id}' 2>/dev/null); do
+  # A lone sidebar (its window's panes all closed) goes, except in a window
+  # zoomed by us: its other panes are only moved out.
+  for p in $(tmux list-panes -a -f '#{&&:#{@agents_sidebar},#{&&:#{==:#{window_panes},1},#{==:#{@agents_zoom},}}}' -F '#{pane_id}' 2>/dev/null); do
     tmux kill-pane -t "$p"
   done
   sync_borders
@@ -398,6 +740,8 @@ cmd_sidebar() {
   # Session/window come from the tmux hook; default to the current client's.
   sess=${2:-$(tmux display -p '#{session_id}')}
   here=${3:-$(tmux display -p -t "$sess" '#{window_id}')}
+  # Never in the zoom's hidden session (its window changes fire the hooks too).
+  [ "$(tmux display -p -t "$sess" '#{session_name}' 2>/dev/null)" = "$ZOOM_STASH" ] && return 0
   sb=$(tmux list-panes -s -t "$sess" -f '#{@agents_sidebar}' -F '#{pane_id}' 2>/dev/null | head -n 1)
   case "$action" in
     toggle)
@@ -427,10 +771,20 @@ cmd_sidebar() {
       # window the session shows now, not the one the hook saw.
       here=$(tmux display -p -t "$sess" '#{window_id}' 2>/dev/null) || return 0
       if [ -z "$sb" ]; then cmd_sidebar open "$sess" "$here"; return 0; fi
-      [ "$(tmux display -p -t "$sb" '#{window_id}')" = "$here" ] && return 0
+      # Where the sidebar is: window, tmux zoom flag, active (= zoomed) pane.
+      src=$(tmux display -p -t "$sb" '#{window_id} #{window_zoomed_flag} #{P:#{?pane_active,#{pane_id},}}')
+      [ "${src%% *}" = "$here" ] && return 0
       [ "$(tmux display -p -t "$here" '#{window_zoomed_flag}')" = 1 ] && return 0
       target=$(tmux list-panes -t "$here" -f '#{!=:#{pane_floating_flag},1}' -F '#{pane_id}' | head -n 1)
-      tmux join-pane -hbf -d -l "$width" -s "$sb" -t "$target"
+      # Taking a pane out of a tmux-zoomed window unzooms it: zoom the pane
+      # you left zoomed again, in the same command.
+      zp=${src##* }
+      case "$src" in *" 1 "*) [ "$zp" != "$sb" ] || zp="" ;; *) zp="" ;; esac
+      if [ -n "$zp" ]; then
+        tmux join-pane -hbf -d -l "$width" -s "$sb" -t "$target" \; resize-pane -Z -t "$zp"
+      else
+        tmux join-pane -hbf -d -l "$width" -s "$sb" -t "$target"
+      fi
       sync_borders ;;
     save)
       # After a resize in window $3: remember the sidebar's width, if it is there.
@@ -450,12 +804,15 @@ case "${1:-}" in
   claude-hook) cmd_agent_hook claude ;;
   codex-hook) cmd_agent_hook codex ;;
   sidebar) shift; cmd_sidebar "$@" ;;
+  zoom) shift; cmd_zoom "$@" ;;
+  setup-prompt) shift; cmd_setup_prompt "$@" ;;
   toast) shift; cmd_toast "$@" ;;
   toast-body) shift; cmd_toast_body "$@" ;;
   *)
     echo "usage: tmux-agents report <working|blocked|done|idle> [agent] [note]" >&2
     echo "       tmux-agents clear [pane] | seen | sweep | claude-hook | codex-hook" >&2
     echo "       tmux-agents sidebar [toggle|open|follow|save]" >&2
+    echo "       tmux-agents zoom [toggle [window] [pane]|restore [window]|restore-all]" >&2
     echo "       tmux-agents toast <state> <agent> <name> <text> <where>" >&2
     exit 2 ;;
 esac

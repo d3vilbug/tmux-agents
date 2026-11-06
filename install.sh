@@ -5,6 +5,7 @@
 #   ./install.sh                 install everything that applies
 #   ./install.sh --uninstall     undo it
 #   ./install.sh --dry-run       show what would change (diffs), change nothing
+#   ./install.sh --setup         connect the agents only, asking first (the TPM popup)
 #   options: --no-tmux --no-claude --no-opencode --no-codex
 #
 # Steps:
@@ -22,6 +23,7 @@ BIN="$ROOT/bin/tmux-agents"
 ENTRY="$ROOT/tmux-agents.tmux"
 # run-shell hands its argument to sh -c: quote the path (it may contain spaces).
 ENTRY_SH="'$(printf '%s' "$ENTRY" | sed "s/'/'\\\\''/g")'"
+SIDEBAR_SH="'$(printf '%s' "$ROOT/sidebar/sidebar.ts" | sed "s/'/'\\\\''/g")'"
 case "$ENTRY" in "$HOME"/*) ENTRY_T="~${ENTRY#"$HOME"}" ;; *) ENTRY_T="$ENTRY" ;; esac
 CMD="'$BIN' claude-hook"
 CMD_CODEX="'$BIN' codex-hook"
@@ -43,7 +45,9 @@ for a in "$@"; do
     --no-claude) do_claude=0 ;;
     --no-opencode) do_opencode=0 ;;
     --no-codex) do_codex=0 ;;
-    -h | --help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --setup) mode=setup ;;
+    --check-setup) mode=check ;;
+    -h | --help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $a (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -55,7 +59,9 @@ ok() { printf '  %s✓%s %s\n' "$G" "$N" "$1"; }
 warn() { printf '  %s!%s %s\n' "$Y" "$N" "$1"; }
 fail() { printf '  %s✗%s %s\n' "$R" "$N" "$1"; }
 # A change: done, or (dry run) would be done.
-did() { if [ "$dry" = 1 ]; then printf '  %s~%s would: %s\n' "$C" "$N" "$1"; else ok "$1"; fi; }
+left=0    # uninstall: something could not be removed
+changes=0 # set by did(): something was (or would be) changed
+did() { changes=1; if [ "$dry" = 1 ]; then printf '  %s~%s would: %s\n' "$C" "$N" "$1"; else ok "$1"; fi; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Scratch files live in one private dir, removed on exit. (tmpfile runs in a
@@ -75,9 +81,14 @@ put() {
     diff -u "$old" "$new" | sed -e '1,2d' -e 's/^/      /' || true
     return 0
   fi
+  if [ -f "$f" ] && [ ! -w "$f" ]; then
+    fail "cannot write $f (permission denied): fix the permissions, then run again"; exit 1
+  fi
   if [ -f "$f" ]; then cp "$f" "$f.bak-$STAMP" && ok "backup: $f.bak-$STAMP"; fi
-  mkdir -p "$(dirname "$f")"
-  cat "$new" >"$f"
+  mkdir -p "$(dirname "$f")" 2>/dev/null
+  if ! cat "$new" 2>/dev/null >"$f"; then
+    fail "cannot write $f: fix the permissions, then run again"; exit 1
+  fi
 }
 
 # jq_put <file> <jq args...>: apply a jq filter to <file> ({} if missing).
@@ -85,7 +96,8 @@ put() {
 jq_put() {
   f=$1; shift
   src=$f
-  if [ ! -s "$f" ]; then src=$(tmpfile); echo '{}' >"$src"; fi
+  # Missing, empty or only whitespace: start from {}.
+  if [ ! -s "$f" ] || ! grep -q '[^[:space:]]' "$f"; then src=$(tmpfile); echo '{}' >"$src"; fi
   new=$(tmpfile)
   if ! jq "$@" "$src" >"$new" 2>/dev/null; then
     fail "$f is not valid JSON: fix it, then run again (file left untouched)"
@@ -94,14 +106,18 @@ jq_put() {
   put "$f" "$new"
 }
 
+# The file tmux reads: ~/.tmux.conf, $XDG_CONFIG_HOME/tmux/tmux.conf, then
+# ~/.config/tmux/tmux.conf (read even when XDG_CONFIG_HOME points elsewhere).
 tmux_conf() {
-  x="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
-  if [ -f "$HOME/.tmux.conf" ]; then echo "$HOME/.tmux.conf"
-  elif [ -f "$x" ]; then echo "$x"
-  else echo "$HOME/.tmux.conf"; fi
+  for c in "$HOME/.tmux.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf" "$HOME/.config/tmux/tmux.conf"; do
+    [ -f "$c" ] && { echo "$c"; return; }
+  done
+  echo "$HOME/.tmux.conf"
 }
 tmux_running() { have tmux && tmux list-sessions >/dev/null 2>&1; }
 # Our run-shell line is in <conf> (commented-out lines do not count).
+# tmux-agents is a TPM plugin in <conf> (an uncommented @plugin line).
+tpm_in_conf() { [ -f "$1" ] && grep -v '^[[:space:]]*#' "$1" | tr -d '\r' | grep -qE "^[[:space:]]*set(-option)?[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*@plugin[[:space:]]+['\"]?[^'\" ]*/tmux-agents(\.git)?(#[^'\" ]*)?(['\"]|[[:space:]]|\$)"; }
 ours_in_conf() { [ -f "$1" ] && grep -v '^[[:space:]]*#' "$1" | grep -qF -e "$ENTRY" -e "$ENTRY_T"; }
 
 # Other tmux-agents installs (another clone) in the same configs: both would
@@ -167,7 +183,7 @@ check_deps() {
 # wins), else from the running server, else the default from defaults.conf.
 agents_key() {
   k=""
-  [ -f "$1" ] && k=$(grep -v '^[[:space:]]*#' "$1" |
+  [ -f "$1" ] && k=$(grep -v '^[[:space:]]*#' "$1" | tr -d '\r' |
     sed -n 's/^[[:space:]]*set\(-option\)\{0,1\}[[:space:]]\{1,\}\(-[a-zA-Z]*[[:space:]]\{1,\}\)*@agents-key[[:space:]]\{1,\}//p' |
     tail -n 1 | sed "s/[[:space:]]*#.*//; s/^[\"']//; s/[\"'][[:space:]]*\$//")
   [ -n "$k" ] || { tmux_running && k=$(tmux show -gqv @agents-key 2>/dev/null); } || true
@@ -182,7 +198,7 @@ key_conflicts() { # <conf> <key>
   kre=$(printf '%s' "$key" | sed 's/[][\\.*^$/]/\\&/g')
   hits=""
   if [ -f "$conf" ]; then
-    hits=$(grep -n '' "$conf" | grep -v '^[0-9]*:[[:space:]]*#' | grep -v 'tmux-agents' |
+    hits=$(tr -d '\r' <"$conf" | grep -n '' | grep -v '^[0-9]*:[[:space:]]*#' | grep -v 'tmux-agents' |
       grep -E "^[0-9]+:[[:space:]]*bind(-key)?[[:space:]]+(-r[[:space:]]+)?(-T[[:space:]]*prefix[[:space:]]+)?(-r[[:space:]]+)?['\"]?$kre['\"]?([[:space:]]|\$)" || true)
   fi
   if [ -n "$hits" ]; then
@@ -203,7 +219,10 @@ key_conflicts() { # <conf> <key>
 install_tmux() {
   step "tmux"
   conf=$(tmux_conf)
-  if ours_in_conf "$conf"; then
+  if tpm_in_conf "$conf"; then
+    ok "loaded by TPM (@plugin line in $conf): no run-shell line needed"
+    ours_in_conf "$conf" && warn "$conf also has the run-shell line: it loads twice; remove one of them"
+  elif ours_in_conf "$conf"; then
     ok "already in $conf"
   else
     new=$(tmpfile)
@@ -218,6 +237,22 @@ install_tmux() {
   elif [ "$dry" = 1 ]; then did "load $ENTRY into the running tmux server"
   elif tmux run-shell "$ENTRY_SH"; then ok "loaded into the running tmux server (prefix + $key opens the sidebar)"
   else warn "could not load it into the running tmux server: run 'tmux source ~/.tmux.conf'"; fi
+  restart_sidebars
+}
+
+# Open sidebars keep running the code they started with: restart them on this
+# copy, in place (same pane, same width), so an update applies right away.
+restart_sidebars() {
+  tmux_running || return 0
+  sbs=$(tmux list-panes -a -f '#{@agents_sidebar}' -F '#{pane_id}' 2>/dev/null)
+  [ -n "$sbs" ] || return 0
+  n=$(printf '%s\n' "$sbs" | wc -l | tr -d ' ')
+  if [ "$dry" = 1 ]; then did "restart $n open sidebar(s) on the new code"; return 0; fi
+  if ! have bun; then warn "bun not found: $n open sidebar(s) left as they are"; return 0; fi
+  for sb in $sbs; do
+    tmux respawn-pane -k -t "$sb" "exec bun $SIDEBAR_SH" 2>/dev/null && tmux set -p -t "$sb" @agents_sidebar 1
+  done
+  ok "restarted $n open sidebar(s) on the new code"
 }
 
 install_claude() {
@@ -356,9 +391,11 @@ uninstall_tmux() {
   else
     ok "not in $conf"
   fi
+  tpm_in_conf "$conf" && warn "TPM still loads it on the next tmux start: remove the @plugin line from $conf, then press prefix + alt + u (TPM clean) and run tmux source $conf"
   if ! tmux_running; then return; fi
   if [ "$dry" = 1 ]; then
-    did "remove the key and hooks (indexes 90-93) from the running tmux server"
+    did "remove the key and hooks (indexes 90-96) from the running tmux server"
+    [ "$(tmux show -gqv @agents_zoom_bound)" = 1 ] && did "give prefix + z back to tmux zoom, undo any sidebar-aware zoom"
     n=$(tmux list-panes -a -f '#{||:#{@agents_sidebar},#{@agents_toast}}' -F x 2>/dev/null | wc -l | tr -d ' ')
     [ "$n" = 0 ] || did "close $n open sidebar/toast pane(s)"
     did "clear the plugin's pane, window and global state (@agent*, @agents_*)"
@@ -368,36 +405,64 @@ uninstall_tmux() {
   # The key and hooks go first: closing the panes below would otherwise fire
   # after-kill-pane, and its background sweep could set window state again
   # after it was cleared.
-  key=$(tmux show -gqv @agents-key); tmux unbind-key "${key:-a}" 2>/dev/null
+  key=$(tmux show -gqv @agents-key)
+  tmux list-keys -T prefix "${key:-a}" 2>/dev/null | grep -q 'tmux-agents' && tmux unbind-key "${key:-a}" 2>/dev/null
   for h in session-window-changed client-session-changed after-select-pane client-focus-in; do
     tmux set-hook -gu "$h[90]"; tmux set-hook -gu "$h[91]"
   done
   tmux set-hook -gu 'pane-exited[92]'; tmux set-hook -gu 'after-kill-pane[92]'
-  tmux set-hook -gu 'after-resize-pane[93]'
+  tmux set-hook -gu 'after-resize-pane[93]'; tmux set-hook -gu 'client-attached[94]'; tmux set-hook -gu 'pane-moved[95]'; tmux set-hook -gu 'window-resized[96]'
+  # Undo a sidebar-aware zoom (moved-out panes come back) and give prefix + z
+  # back to tmux, before the sidebar it relies on is closed.
+  [ "$(tmux show -gqv @agents_zoom_bound)" = 1 ] && tmux bind-key z resize-pane -Z
+  "$BIN" zoom restore-all 2>/dev/null
   # Sidebars and toasts next: a running sidebar would keep writing state.
   for p in $(tmux list-panes -a -f '#{||:#{@agents_sidebar},#{@agents_toast}}' -F '#{pane_id}' 2>/dev/null); do
     tmux kill-pane -t "$p" 2>/dev/null
   done
+  # The active border the sidebar hid: back to the style you had on that
+  # window (none: the global one), unless you set another one meanwhile.
+  tmux list-windows -a -F '#{window_id}' -f '#{||:#{@agents_border_hidden},#{@agents_border_saved}}' 2>/dev/null | while read -r w; do
+    ours=$(tmux show -wqv -t "$w" @agents_border_hidden); saved=$(tmux show -wqv -t "$w" @agents_border_saved)
+    if [ "$ours" = 1 ] || { [ -n "$ours" ] && [ "$(tmux show -wqv -t "$w" pane-active-border-style)" = "$ours" ]; }; then
+      if [ -n "$saved" ]; then tmux set -w -t "$w" pane-active-border-style "$saved"; else tmux set -wu -t "$w" pane-active-border-style; fi
+    fi
+    tmux set -wu -t "$w" @agents_border_hidden \; set -wu -t "$w" @agents_border_saved
+  done 2>/dev/null
   # Runtime state, in one batch: per pane, per window (incl. the border the
   # sidebar hid), and globals. User settings (@agents-...) are left alone.
   {
     for p in $(tmux list-panes -a -F '#{pane_id}' 2>/dev/null); do
-      for o in @agent @agent_state @agent_since @agent_note @agent_shell_since; do echo "set -pqu -t $p $o"; done
+      for o in @agent @agent_state @agent_since @agent_note @agent_shell_since @agents_zoom_from; do echo "set -pqu -t $p $o"; done
     done
-    tmux list-windows -a -F '#{window_id} #{@agents_border_hidden}' 2>/dev/null | while read -r w hidden; do
+    tmux list-windows -a -F '#{window_id}' 2>/dev/null | while read -r w; do
       echo "set -wqu -t $w @agent_win_state"; echo "set -wqu -t $w @agent_win_agent"
-      [ "$hidden" = 1 ] && { echo "set -wqu -t $w pane-active-border-style"; echo "set -wqu -t $w @agents_border_hidden"; }
+      echo "set -wqu -t $w @agents_zoom"; echo "set -wqu -t $w @agents_zoom_layout"
     done
     tmux show -g 2>/dev/null | awk '$1 ~ /^@agents_/ || $1 == "@agents-tab-icon" { print "set -gqu " $1 }'
   } | tmux source-file - 2>/dev/null
-  tmux source-file "$conf" 2>/dev/null
+  if tpm_in_conf "$conf"; then
+    # Sourcing would run TPM, which loads tmux-agents straight back while the
+    # @plugin line is there: strip our tab icon and status-line sweep instead.
+    for f in window-status-format window-status-current-format; do
+      tmux set -gw "$f" "$(tmux show -gwv "$f" | sed 's/#{E:@agents-tab-icon}//g')"
+    done
+    tmux set -g status-right "$(tmux show -gv status-right | sed "s|#('[^']*/tmux-agents' sweep[^)]*)||g")"
+  else
+    tmux source-file "$conf" 2>/dev/null
+  fi
   set -e
   ok "key, hooks, sidebars and state removed from the running tmux server (theme reloaded)"
 }
 
 uninstall_claude() {
   step "Claude Code"
-  { [ -f "$CLAUDE_SETTINGS" ] && have jq; } || { ok "nothing to do"; return; }
+  [ -f "$CLAUDE_SETTINGS" ] || { ok "nothing to do"; return; }
+  if ! have jq; then
+    if grep -q 'tmux-agents' "$CLAUDE_SETTINGS"; then fail "jq is needed to remove the hooks from $CLAUDE_SETTINGS: install jq, then run again"; left=1
+    else ok "nothing to do"; fi
+    return
+  fi
   rc=0
   jq_put "$CLAUDE_SETTINGS" --arg cmd "$CMD" '
     if .hooks then .hooks |= (with_entries(.value |= map(select(any(.hooks[]?; .command == $cmd) | not)))
@@ -415,7 +480,12 @@ uninstall_claude() {
 
 uninstall_codex() {
   step "Codex"
-  { [ -f "$CODEX_HOOKS" ] && have jq; } || { ok "nothing to do"; return; }
+  [ -f "$CODEX_HOOKS" ] || { ok "nothing to do"; return; }
+  if ! have jq; then
+    if grep -q 'tmux-agents' "$CODEX_HOOKS"; then fail "jq is needed to remove the hooks from $CODEX_HOOKS: install jq, then run again"; left=1
+    else ok "nothing to do"; fi
+    return
+  fi
   rc=0
   # Only events this removal emptied are dropped; an empty list the user had stays.
   jq_put "$CODEX_HOOKS" --arg cmd "$CMD_CODEX" '
@@ -442,7 +512,12 @@ uninstall_codex() {
 
 uninstall_opencode() {
   step "OpenCode"
-  { [ -f "$OPENCODE_CLI" ] && have jq; } || { ok "nothing to do"; return; }
+  [ -f "$OPENCODE_CLI" ] || { ok "nothing to do"; return; }
+  if ! have jq; then
+    if grep -q 'tmux-agents' "$OPENCODE_CLI"; then fail "jq is needed to remove the plugin from $OPENCODE_CLI: install jq, then run again"; left=1
+    else ok "nothing to do"; fi
+    return
+  fi
   rc=0
   jq_put "$OPENCODE_CLI" --arg p "$PLUGIN" 'if .plugins then .plugins |= map(select(. != $p)) else . end' || rc=$?
   case $rc in
@@ -456,8 +531,65 @@ uninstall_opencode() {
   esac
 }
 
+# --- setup (the popup TPM users get) -----------------------------------------
+
+# Put a setting into <conf> before the TPM run line (so it is set before the
+# plugins load), else at the end.
+add_setting() { # <conf> <line>
+  new=$(tmpfile)
+  if [ -f "$1" ] && grep -qE "^[[:space:]]*run(-shell)?[[:space:]].*tpm/tpm" "$1"; then
+    L="$2" awk '!done && /^[[:space:]]*run(-shell)?[[:space:]].*tpm\/tpm/ { print ENVIRON["L"]; done = 1 } { print }' "$1" >"$new"
+  else
+    { [ -f "$1" ] && cat "$1"; printf '%s\n' "$2"; } >"$new"
+  fi
+  put "$1" "$new" || true
+}
+
+agent_steps() {
+  if [ "$do_claude" = 1 ]; then install_claude; fi
+  if [ "$do_codex" = 1 ]; then install_codex; fi
+  if [ "$do_opencode" = 1 ]; then install_opencode; fi
+}
+
+setup() {
+  printf '%stmux-agents: connect your coding agents%s\n' "$B" "$N"
+  printf 'This adds the tmux-agents hooks to the agents installed here (each file is backed up first).\n'
+  want_dry=$dry; dry=1; changes=0
+  agent_steps
+  if [ "$changes" = 0 ]; then
+    printf '\nNothing to do: every installed agent is already connected.\n'
+  else
+    printf '\nConnect them? [y] yes  [n] not now (ask again next time)  [x] never ask again: '
+    read -r ans || ans=n
+    case "$ans" in
+      y | Y | yes)
+        dry=$want_dry; agent_steps; other_installs ;;
+      x | X)
+        dry=$want_dry; conf=$(tmux_conf)
+        if grep -v '^[[:space:]]*#' "$conf" 2>/dev/null | grep -q '@agents-setup-prompt[[:space:]]\{1,\}off'; then
+          ok "@agents-setup-prompt is already off in $conf"
+        else
+          add_setting "$conf" "set -g @agents-setup-prompt off"
+          did "add \`set -g @agents-setup-prompt off\` to $conf"
+        fi
+        [ "$dry" = 1 ] || { tmux_running && tmux set -g @agents-setup-prompt off; }
+        printf 'Run %s/install.sh --setup any time.\n' "$ROOT" ;;
+      *)
+        printf 'Not now. Run %s/install.sh --setup any time.\n' "$ROOT" ;;
+    esac
+  fi
+  printf '\nPress Enter to close. '
+  read -r _ || true
+}
+
 # --- main --------------------------------------------------------------------
 
+# Exit 0 when connecting the agents would change something (for the popup).
+if [ "$mode" = check ]; then
+  dry=1; { check_deps; agent_steps; } >/dev/null 2>&1
+  [ "$changes" = 1 ]; exit $?
+fi
+if [ "$mode" = setup ]; then check_deps >/dev/null; setup; exit 0; fi
 [ "$dry" = 1 ] && printf '%sDry run:%s nothing is written, tmux is not touched.\n' "$B" "$N"
 printf 'tmux-agents at %s\n' "$ROOT"
 if [ "$mode" = install ]; then
@@ -476,5 +608,6 @@ else
   if [ "$do_opencode" = 1 ]; then uninstall_opencode; fi
   other_installs
   if [ "$dry" = 1 ]; then printf '\n%sDry run done.%s Run without --dry-run to apply.\n' "$B" "$N"
+  elif [ "$left" = 1 ]; then printf '\n%sNot fully uninstalled.%s Fix the errors above, then run --uninstall again before deleting %s.\n' "$B" "$N" "$ROOT"; exit 1
   else printf '\n%sUninstalled.%s The folder %s can be deleted.\n' "$B" "$N" "$ROOT"; fi
 fi
